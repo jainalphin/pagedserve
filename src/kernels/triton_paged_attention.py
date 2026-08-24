@@ -61,7 +61,10 @@ def _paged_decode_attention_kernel(
         context_lengths + request_index * context_length_stride
     )
     logical_block_count = tl.cdiv(context_length, KV_BLOCK_SIZE)
-    layer_index_64 = layer_id.to(tl.int64)
+    # Triton may specialize layer IDs 0 and 1 as Python integers. Adding the
+    # value to an int64 tensor works for both specialized constants and runtime
+    # scalar arguments while keeping all subsequent pool offsets in int64.
+    layer_index_64 = tl.zeros((1,), dtype=tl.int64) + layer_id
 
     # Online-softmax state. Keeping it in FP32 avoids accumulating decode
     # probabilities and weighted values in the cache's lower precision dtype.

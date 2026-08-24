@@ -368,7 +368,6 @@ def test_triton_paged_decode_matches_torch_across_kv_blocks():
     num_heads = 2
     head_dim = 64
     num_layers = 12
-    tested_layer = num_layers - 1
     manager = KVCacheManager(
         block_size=16,
         total_memory=4 * 1024 * 1024,
@@ -414,23 +413,24 @@ def test_triton_paged_decode_matches_torch_across_kv_blocks():
                 torch.randn(num_heads, head_dim, device=device),
             )
 
-    expected = PagedAttention(
-        manager,
-        decode_attention_backend="torch",
-    ).forward_batch(
-        request_ids,
-        tested_layer,
-        queries,
-    )
-    actual = PagedAttention(
-        manager,
-        decode_attention_backend="triton",
-    ).forward_batch(
-        request_ids,
-        tested_layer,
-        queries,
-    )
-    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+    for tested_layer in (0, num_layers - 1):
+        expected = PagedAttention(
+            manager,
+            decode_attention_backend="torch",
+        ).forward_batch(
+            request_ids,
+            tested_layer,
+            queries,
+        )
+        actual = PagedAttention(
+            manager,
+            decode_attention_backend="triton",
+        ).forward_batch(
+            request_ids,
+            tested_layer,
+            queries,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
 
 
 def test_batched_fresh_prefill_matches_individual_causal_attention():
