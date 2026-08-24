@@ -61,6 +61,7 @@ def _paged_decode_attention_kernel(
         context_lengths + request_index * context_length_stride
     )
     logical_block_count = tl.cdiv(context_length, KV_BLOCK_SIZE)
+    layer_index_64 = layer_id.to(tl.int64)
 
     # Online-softmax state. Keeping it in FP32 avoids accumulating decode
     # probabilities and weighted values in the cache's lower precision dtype.
@@ -74,12 +75,16 @@ def _paged_decode_attention_kernel(
             + request_index * table_stride_batch
             + logical_block * table_stride_block
         )
+        # Large KV pools can make layer_id * layer_stride exceed int32 even
+        # though each individual stride and block ID fits. Cast before doing
+        # either multiplication so pointer offsets cannot wrap.
+        physical_block_64 = physical_block.to(tl.int64)
         token_positions = logical_block * KV_BLOCK_SIZE + token_offsets
         token_mask = token_positions < context_length
 
         key_offsets = (
-            layer_id * key_stride_layer
-            + physical_block * key_stride_block
+            layer_index_64 * key_stride_layer
+            + physical_block_64 * key_stride_block
             + head_index * key_stride_head
             + token_offsets[:, None] * key_stride_token
             + dimension_offsets[None, :] * key_stride_dim
@@ -100,8 +105,8 @@ def _paged_decode_attention_kernel(
         probabilities = tl.exp(scores - new_max)
 
         value_offsets = (
-            layer_id * value_stride_layer
-            + physical_block * value_stride_block
+            layer_index_64 * value_stride_layer
+            + physical_block_64 * value_stride_block
             + head_index * value_stride_head
             + token_offsets[:, None] * value_stride_token
             + dimension_offsets[None, :] * value_stride_dim

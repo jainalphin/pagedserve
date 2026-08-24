@@ -367,12 +367,14 @@ def test_triton_paged_decode_matches_torch_across_kv_blocks():
     device = torch.device("cuda")
     num_heads = 2
     head_dim = 64
+    num_layers = 12
+    tested_layer = num_layers - 1
     manager = KVCacheManager(
         block_size=16,
-        total_memory=256 * 1024,
+        total_memory=4 * 1024 * 1024,
         tensor_dtype=torch.float32,
         device=device,
-        num_layers=1,
+        num_layers=num_layers,
         num_kv_heads=num_heads,
         head_dim=head_dim,
     )
@@ -388,33 +390,36 @@ def test_triton_paged_decode_matches_torch_across_kv_blocks():
     for request_id, context_length in zip(request_ids, context_lengths):
         prompt_length = context_length - 1
         if prompt_length:
+            layer_cache = [
+                (
+                    torch.randn(
+                        num_heads, prompt_length, head_dim, device=device
+                    ),
+                    torch.randn(
+                        num_heads, prompt_length, head_dim, device=device
+                    ),
+                )
+                for _ in range(num_layers)
+            ]
             manager.store_prefill_request(
                 request_id,
-                [
-                    (
-                        torch.randn(
-                            num_heads, prompt_length, head_dim, device=device
-                        ),
-                        torch.randn(
-                            num_heads, prompt_length, head_dim, device=device
-                        ),
-                    )
-                ],
+                layer_cache,
             )
         manager.reserve_token_slot(request_id)
-        manager.write_layer_kv(
-            request_id,
-            0,
-            torch.randn(num_heads, head_dim, device=device),
-            torch.randn(num_heads, head_dim, device=device),
-        )
+        for layer_id in range(num_layers):
+            manager.write_layer_kv(
+                request_id,
+                layer_id,
+                torch.randn(num_heads, head_dim, device=device),
+                torch.randn(num_heads, head_dim, device=device),
+            )
 
     expected = PagedAttention(
         manager,
         decode_attention_backend="torch",
     ).forward_batch(
         request_ids,
-        0,
+        tested_layer,
         queries,
     )
     actual = PagedAttention(
@@ -422,7 +427,7 @@ def test_triton_paged_decode_matches_torch_across_kv_blocks():
         decode_attention_backend="triton",
     ).forward_batch(
         request_ids,
-        0,
+        tested_layer,
         queries,
     )
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
