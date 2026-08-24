@@ -73,6 +73,11 @@ def parse_args():
         required=True,
     )
     parser.add_argument("--pagedserve-strategy", choices=("orca", "sarathi"), default="orca")
+    parser.add_argument(
+        "--decode-attention-backend",
+        choices=("torch", "triton"),
+        default="torch",
+    )
     parser.add_argument("--model-id", default="openai-community/gpt2")
     parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--input-length", type=positive_int, required=True)
@@ -148,6 +153,8 @@ def build_worker_command(args, worker_index, output_path):
             (
                 "--pagedserve-strategy",
                 args.pagedserve_strategy,
+                "--decode-attention-backend",
+                args.decode_attention_backend,
                 "--kv-cache-memory-utilization",
                 str(args.kv_cache_memory_utilization),
                 "--kv-cache-safety-mb",
@@ -329,6 +336,9 @@ def main():
         "pagedserve_strategy": (
             args.pagedserve_strategy if args.engine == "pagedserve" else None
         ),
+        "decode_attention_backend": (
+            args.decode_attention_backend if args.engine == "pagedserve" else None
+        ),
         "gpu_ids": args.gpu,
         "model_metadata": model_metadata,
         "settings": {
@@ -341,6 +351,7 @@ def main():
             "seed": args.seed,
             "num_requests_per_replica": args.num_requests_per_replica,
             "max_batch_size": args.max_batch_size,
+            "decode_attention_backend": args.decode_attention_backend,
             "offered_request_rates": args.request_rate,
             "kv_cache_memory_mb": args.kv_cache_memory_mb,
             "kv_cache_memory_utilization": args.kv_cache_memory_utilization,

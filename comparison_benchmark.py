@@ -29,6 +29,7 @@ from main import (
     DEFAULT_CUDA_KV_MEMORY_UTILIZATION,
     DEFAULT_CUDA_KV_SAFETY_MB,
     GPT2_MODEL,
+    SUPPORTED_DECODE_ATTENTION_BACKENDS,
     SUPPORTED_DTYPES,
     build_scheduler,
 )
@@ -948,6 +949,11 @@ def parse_args():
         choices=("orca", "sarathi"),
         default="sarathi",
     )
+    parser.add_argument(
+        "--decode-attention-backend",
+        choices=SUPPORTED_DECODE_ATTENTION_BACKENDS,
+        default="torch",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--telemetry-interval-ms", type=positive_integer, default=200)
@@ -963,6 +969,11 @@ def validate_args(args):
         raise RuntimeError("The vLLM comparison requires a supported GPU environment")
     if not torch.cuda.is_available() and args.dtype != "float32":
         raise ValueError("CPU comparison runs must use float32")
+    if args.decode_attention_backend == "triton":
+        if args.engine != "pagedserve":
+            raise ValueError("Triton decode attention applies only to PagedServe")
+        if not torch.cuda.is_available():
+            raise ValueError("Triton decode attention requires CUDA")
     shapes = args.request_shape or [(args.input_length, args.output_length, 1.0)]
     if any(input_length + output_length > args.max_model_len for input_length, output_length, _ in shapes):
         raise ValueError("a request shape exceeds max_model_len")
@@ -1023,6 +1034,7 @@ def base_report(args, input_lengths, output_lengths):
             "kv_cache_safety_mb": args.kv_cache_safety_mb,
             "prefill_chunk_size": args.prefill_chunk_size,
             "pagedserve_strategy": args.pagedserve_strategy,
+            "decode_attention_backend": args.decode_attention_backend,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "vllm_enforce_eager": args.vllm_enforce_eager,
             "ttft_slo_ms": args.ttft_slo_ms,
@@ -1061,6 +1073,7 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
         kv_cache_memory_utilization=args.kv_cache_memory_utilization,
         kv_cache_safety_mb=args.kv_cache_safety_mb,
         execution_dtype=args.dtype,
+        decode_attention_backend=args.decode_attention_backend,
     )
     synchronize_cuda()
     initialization_seconds = time.perf_counter() - initialization_start
@@ -1072,6 +1085,7 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
     report["gpu_lifecycle"]["after_warmup"] = nvidia_smi_snapshot()
     report["engine_metadata"] = {
         "policy": "continuous_batching",
+        "decode_attention_backend": args.decode_attention_backend,
         "model_dtype": str(next(scheduler.model_engine.parameters()).dtype),
         "initialization_seconds": initialization_seconds,
         "warmup_seconds": warmup_seconds,

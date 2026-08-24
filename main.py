@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 
 import torch
 
@@ -23,6 +24,7 @@ DISTILGPT2_MODEL = "distilgpt2"
 GPT2_MODEL = "gpt2"
 SUPPORTED_MODELS = (REFERENCE_MODEL, DISTILGPT2_MODEL, GPT2_MODEL)
 SUPPORTED_DTYPES = ("float32", "float16", "bfloat16")
+SUPPORTED_DECODE_ATTENTION_BACKENDS = ("torch", "triton")
 MIB = 1024 * 1024
 DEFAULT_CUDA_KV_MEMORY_UTILIZATION = 0.90
 DEFAULT_CUDA_KV_SAFETY_MB = 3072
@@ -141,8 +143,23 @@ def build_scheduler(
     kv_cache_memory_utilization=DEFAULT_CUDA_KV_MEMORY_UTILIZATION,
     kv_cache_safety_mb=DEFAULT_CUDA_KV_SAFETY_MB,
     execution_dtype="float32",
+    decode_attention_backend="torch",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if decode_attention_backend not in SUPPORTED_DECODE_ATTENTION_BACKENDS:
+        choices = ", ".join(SUPPORTED_DECODE_ATTENTION_BACKENDS)
+        raise ValueError(
+            f"Unknown decode attention backend '{decode_attention_backend}'. "
+            f"Choose one of: {choices}"
+        )
+    if decode_attention_backend == "triton" and device.type != "cuda":
+        raise ValueError("The Triton decode attention backend requires CUDA")
+    if (
+        decode_attention_backend == "triton"
+        and importlib.util.find_spec("triton") is None
+    ):
+        raise ImportError("The Triton decode attention backend requires triton")
+
     resolved_dtype = _resolve_execution_dtype(execution_dtype, device)
     before_model_memory = cuda_memory_snapshot(device)
     model, tokenizer, config, default_kv_cache_memory = _load_model(
@@ -216,6 +233,7 @@ def build_scheduler(
     }
     paged_attention = PagedAttention(
         kv_manager=kv_manager,
+        decode_attention_backend=decode_attention_backend,
     )
     return ContinuousBatchScheduler(
         model_engine=model,
@@ -276,6 +294,12 @@ def main():
         default="float32",
         help="execution dtype; float16/bfloat16 are explicit optimized runs",
     )
+    parser.add_argument(
+        "--decode-attention-backend",
+        choices=SUPPORTED_DECODE_ATTENTION_BACKENDS,
+        default="torch",
+        help="single-token decode attention implementation",
+    )
     args = parser.parse_args()
 
     scheduler = build_scheduler(
@@ -287,6 +311,7 @@ def main():
         kv_cache_memory_utilization=args.kv_cache_memory_utilization,
         kv_cache_safety_mb=args.kv_cache_safety_mb,
         execution_dtype=args.dtype,
+        decode_attention_backend=args.decode_attention_backend,
     )
     first_request = scheduler.add_request("Paged attention", max_new_tokens=8)
     second_request = scheduler.add_request("Orca", max_new_tokens=8)

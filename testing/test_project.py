@@ -1,5 +1,6 @@
 import math
 
+import pytest
 import torch
 
 from src.model.kv_manager import KVCacheManager
@@ -357,6 +358,74 @@ def test_batched_decode_attention_matches_scalar_with_variable_contexts():
     )
     actual = attention.forward_batch(request_ids, 0, queries)
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_triton_paged_decode_matches_torch_across_kv_blocks():
+    pytest.importorskip("triton")
+    torch.manual_seed(45)
+    device = torch.device("cuda")
+    num_heads = 2
+    head_dim = 64
+    manager = KVCacheManager(
+        block_size=16,
+        total_memory=256 * 1024,
+        tensor_dtype=torch.float32,
+        device=device,
+        num_layers=1,
+        num_kv_heads=num_heads,
+        head_dim=head_dim,
+    )
+    request_ids = ["one-token", "partial-block", "three-blocks"]
+    context_lengths = [1, 19, 35]
+    queries = torch.randn(
+        len(request_ids),
+        num_heads,
+        head_dim,
+        device=device,
+    )
+
+    for request_id, context_length in zip(request_ids, context_lengths):
+        prompt_length = context_length - 1
+        if prompt_length:
+            manager.store_prefill_request(
+                request_id,
+                [
+                    (
+                        torch.randn(
+                            num_heads, prompt_length, head_dim, device=device
+                        ),
+                        torch.randn(
+                            num_heads, prompt_length, head_dim, device=device
+                        ),
+                    )
+                ],
+            )
+        manager.reserve_token_slot(request_id)
+        manager.write_layer_kv(
+            request_id,
+            0,
+            torch.randn(num_heads, head_dim, device=device),
+            torch.randn(num_heads, head_dim, device=device),
+        )
+
+    expected = PagedAttention(
+        manager,
+        decode_attention_backend="torch",
+    ).forward_batch(
+        request_ids,
+        0,
+        queries,
+    )
+    actual = PagedAttention(
+        manager,
+        decode_attention_backend="triton",
+    ).forward_batch(
+        request_ids,
+        0,
+        queries,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
 
 
 def test_batched_fresh_prefill_matches_individual_causal_attention():

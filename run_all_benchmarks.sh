@@ -16,6 +16,7 @@ RUN_PRODUCTION=false
 REPETITIONS=1
 REQUESTS_PER_REPLICA=120
 MAX_BATCH_SIZE=128
+DECODE_ATTENTION_BACKEND="torch"
 TTFT_SLO_MS=""
 TPOT_SLO_MS=""
 E2E_SLO_MS=""
@@ -39,6 +40,7 @@ Options:
                                 Repeat to select multiple engines.
   --requests-per-replica N      Requests per GPU and offered rate (default: 120).
   --max-batch-size N            Maximum sequences per worker (default: 128).
+  --decode-attention-backend B  PagedServe decode backend: torch or triton.
   --short-rate RPS              Repeat to replace short-context rates.
   --long-rate RPS               Repeat to replace long-context rates.
   --production-rate RPS         Repeat to replace mixed production-like rates.
@@ -101,6 +103,15 @@ while [[ $# -gt 0 ]]; do
     --max-batch-size)
       require_value "$@"
       MAX_BATCH_SIZE="$2"
+      shift 2
+      ;;
+    --decode-attention-backend)
+      require_value "$@"
+      case "$2" in
+        torch|triton) ;;
+        *) echo "Unknown decode attention backend: $2" >&2; exit 2 ;;
+      esac
+      DECODE_ATTENTION_BACKEND="$2"
       shift 2
       ;;
     --short-rate)
@@ -229,6 +240,7 @@ mkdir -p "$RESULT_ROOT"
   echo "python=$($PYTHON_BIN --version 2>&1)"
   echo "requests_per_replica=$REQUESTS_PER_REPLICA"
   echo "max_batch_size=$MAX_BATCH_SIZE"
+  echo "decode_attention_backend=$DECODE_ATTENTION_BACKEND"
   echo "models=${MODELS[*]}"
   echo "engines=${ENGINES[*]}"
   echo "short_rates=${SHORT_RATES[*]}"
@@ -303,10 +315,18 @@ run_case() {
   case "$engine_label" in
     hf) command+=(--engine hf) ;;
     pagedserve-orca)
-      command+=(--engine pagedserve --pagedserve-strategy orca)
+      command+=(
+        --engine pagedserve
+        --pagedserve-strategy orca
+        --decode-attention-backend "$DECODE_ATTENTION_BACKEND"
+      )
       ;;
     pagedserve-sarathi)
-      command+=(--engine pagedserve --pagedserve-strategy sarathi)
+      command+=(
+        --engine pagedserve
+        --pagedserve-strategy sarathi
+        --decode-attention-backend "$DECODE_ATTENTION_BACKEND"
+      )
       ;;
     vllm) command+=(--engine vllm) ;;
   esac

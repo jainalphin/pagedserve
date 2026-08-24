@@ -7,8 +7,19 @@ from src.model.kv_manager import KVCacheManager
 
 
 class PagedAttention:
-    def __init__(self, kv_manager: KVCacheManager):
+    def __init__(
+        self,
+        kv_manager: KVCacheManager,
+        decode_attention_backend: str = "torch",
+    ):
+        if decode_attention_backend not in ("torch", "triton"):
+            raise ValueError(
+                f"Unknown decode attention backend: {decode_attention_backend!r}. "
+                "Expected 'torch' or 'triton'."
+            )
+
         self.kv_manager = kv_manager
+        self.decode_attention_backend = decode_attention_backend
         self.num_layers = kv_manager.num_layers
         self.num_kv_heads = kv_manager.num_kv_heads
         self.head_dim = kv_manager.head_dim
@@ -44,7 +55,7 @@ class PagedAttention:
 
 
     def compute_weighted_value_sum(self, request_id, layer_id, attention_scores):
-        # online softmax may be?
+        # Scalar Torch reference path; Triton decode uses fused online softmax.
         softmax_probabilities = torch.softmax(attention_scores, dim=-1)
         output = torch.zeros(
             self.num_kv_heads,
@@ -81,6 +92,26 @@ class PagedAttention:
 
         batch_size = len(request_ids)
         assert queries.shape == (batch_size, self.num_kv_heads, self.head_dim)
+
+        if self.decode_attention_backend == "triton":
+            # Keep Triton optional: importing it is only necessary when this
+            # backend is selected on a CUDA system.
+            from src.kernels.triton_paged_attention import (
+                paged_decode_attention_triton,
+            )
+
+            block_table, context_lengths = self.kv_manager.build_decode_metadata(
+                request_ids,
+                layer_id,
+              )
+            return paged_decode_attention_triton(
+                queries,
+                self.kv_manager.key_pool,
+                self.kv_manager.value_pool,
+                block_table,
+                context_lengths,
+                layer_id,
+            )
 
         keys, values, valid_positions = self.kv_manager.gather_decode_layer_batch(
             request_ids,

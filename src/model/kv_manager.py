@@ -353,6 +353,53 @@ class KVCacheManager:
 
         return layer_key, layer_value
 
+    def build_decode_metadata(self, request_ids, layer_id):
+        if not request_ids:
+            raise ValueError("request_ids cannot be empty")
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("request_ids must be unique")
+        if not 0 <= layer_id < self.num_layers:
+            raise ValueError("Invalid layer_id")
+
+        request_infos = []
+        for request_id in request_ids:
+            if request_id not in self.requests:
+                raise RuntimeError(f"Unknown request: {request_id}")
+            request_infos.append(self.requests[request_id])
+        for request_id, request_info in zip(request_ids, request_infos):
+            if request_info.reserved_position is None:
+                raise RuntimeError(f"Request {request_id} has no reserved decode token")
+            if layer_id not in request_info.written_layer_ids:
+                raise RuntimeError(
+                    f"Request {request_id} has not written layer {layer_id}"
+                )
+            if not request_info.block_ids:
+                raise RuntimeError(f"Request {request_id} has no KV blocks")
+
+        block_ids = [request_info.block_ids for request_info in request_infos]
+        context_lengths = [
+            request_info.sequence_length + 1 for request_info in request_infos
+        ]
+        max_blocks = max(len(ids) for ids in block_ids)
+
+        block_ids = [
+            ids + [ids[-1]] * (max_blocks - len(ids)) for ids in block_ids
+        ]
+
+        block_table = torch.tensor(
+            block_ids,
+            dtype=torch.int32,
+            device=self.key_pool.device,
+        )
+
+        context_lengths = torch.tensor(
+            context_lengths,
+            dtype=torch.int32,
+            device=self.key_pool.device,
+        )
+
+        return block_table, context_lengths
+
     def gather_decode_layer_batch(self, request_ids, layer_id):
         """Gather variable-length decode contexts with one batched pool lookup."""
         if not request_ids:
