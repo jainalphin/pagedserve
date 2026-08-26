@@ -25,6 +25,7 @@ GPT2_MODEL = "gpt2"
 SUPPORTED_MODELS = (REFERENCE_MODEL, DISTILGPT2_MODEL, GPT2_MODEL)
 SUPPORTED_DTYPES = ("float32", "float16", "bfloat16")
 SUPPORTED_DECODE_ATTENTION_BACKENDS = ("torch", "triton")
+SUPPORTED_KV_CACHE_DTYPES = ("model", "int8")
 MIB = 1024 * 1024
 DEFAULT_CUDA_KV_MEMORY_UTILIZATION = 0.90
 DEFAULT_CUDA_KV_SAFETY_MB = 3072
@@ -144,6 +145,7 @@ def build_scheduler(
     kv_cache_safety_mb=DEFAULT_CUDA_KV_SAFETY_MB,
     execution_dtype="float32",
     decode_attention_backend="torch",
+    kv_cache_dtype="model",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if decode_attention_backend not in SUPPORTED_DECODE_ATTENTION_BACKENDS:
@@ -159,6 +161,9 @@ def build_scheduler(
         and importlib.util.find_spec("triton") is None
     ):
         raise ImportError("The Triton decode attention backend requires triton")
+    if kv_cache_dtype not in SUPPORTED_KV_CACHE_DTYPES:
+        choices = ", ".join(SUPPORTED_KV_CACHE_DTYPES)
+        raise ValueError(f"Unknown KV cache dtype '{kv_cache_dtype}'. Choose one of: {choices}")
 
     resolved_dtype = _resolve_execution_dtype(execution_dtype, device)
     before_model_memory = cuda_memory_snapshot(device)
@@ -212,6 +217,7 @@ def build_scheduler(
         num_layers=config.num_layers,
         num_kv_heads=config.num_heads,
         head_dim=config.head_dim,
+        cache_dtype=(torch.int8 if kv_cache_dtype == "int8" else resolved_dtype),
     )
     after_kv_memory = cuda_memory_snapshot(device)
     kv_manager.memory_budget_source = memory_budget_source
@@ -300,6 +306,12 @@ def main():
         default="torch",
         help="single-token decode attention implementation",
     )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=SUPPORTED_KV_CACHE_DTYPES,
+        default="model",
+        help="KV storage dtype; int8 uses per-token/per-head symmetric scales",
+    )
     args = parser.parse_args()
 
     scheduler = build_scheduler(
@@ -312,6 +324,7 @@ def main():
         kv_cache_safety_mb=args.kv_cache_safety_mb,
         execution_dtype=args.dtype,
         decode_attention_backend=args.decode_attention_backend,
+        kv_cache_dtype=args.kv_cache_dtype,
     )
     first_request = scheduler.add_request("Paged attention", max_new_tokens=8)
     second_request = scheduler.add_request("Orca", max_new_tokens=8)

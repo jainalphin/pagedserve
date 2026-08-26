@@ -80,7 +80,7 @@ class PagedSelfAttention(nn.Module):
 
         return attn_output, k, v
 
-    def decode(self, hidden_states, request_ids, layer_id, kv_manger: KVCacheManager, paged_attn_manager: PagedAttention):
+    def decode(self, hidden_states, request_ids, layer_id, kv_manger: KVCacheManager, paged_attn_manager: PagedAttention, decode_metadata):
         batch_size = len(request_ids)
         assert hidden_states.shape == (batch_size, 1, self.config.hidden_size)
 
@@ -93,13 +93,15 @@ class PagedSelfAttention(nn.Module):
         v = self.split_heads(v).squeeze(2)
 
         kv_manger.write_layer_kv_batch(request_ids, layer_id, k, v)
-        output = paged_attn_manager.forward_batch(request_ids, layer_id, q) # [B, heads, head_dim]  - attention is sequential per request internally
+        output = paged_attn_manager.forward_batch(
+            request_ids, layer_id, q, decode_metadata=decode_metadata
+        )
         output = output.unsqueeze(2) # [B, heads, 1, head_dim]
         output = self.merge_heads(output)
         output = self.output_linear(output)
         return output
 
-    def forward_iteration(self, hidden_states, items, layer_id, paged_attn_manager: PagedAttention,):
+    def forward_iteration(self, hidden_states, items, layer_id, paged_attn_manager: PagedAttention, decode_metadata=None):
         queries = self.split_heads_flat(self.query_linear(hidden_states))
         keys = self.split_heads_flat(self.key_linear(hidden_states))
         values = self.split_heads_flat(self.value_linear(hidden_states))
@@ -110,6 +112,7 @@ class PagedSelfAttention(nn.Module):
             queries=queries,
             keys=keys,
             values=values,
+            decode_metadata=decode_metadata,
         )
         output = self.output_linear(self.merge_heads_flat(context))
         return output, prefill_kv
@@ -143,13 +146,14 @@ class DecoderBlock(nn.Module):
         hidden_states = self.mlp_down_proj(hidden_states) + mlp_residual
         return hidden_states, key_states, value_states
 
-    def decode(self, hidden_states, request_ids, kv_manger: KVCacheManager, paged_attn_manager: PagedAttention):
+    def decode(self, hidden_states, request_ids, kv_manger: KVCacheManager, paged_attn_manager: PagedAttention, decode_metadata):
         attention_residual = hidden_states
         hidden_states = self.self_attn.decode(self.input_layernorm(hidden_states),
                                                                   request_ids,
                                                                   self.layer_id,
                                                                   kv_manger,
-                                                                  paged_attn_manager)
+                                                                  paged_attn_manager,
+                                                                  decode_metadata)
 
         hidden_states = hidden_states + attention_residual
         mlp_residual = hidden_states
@@ -158,13 +162,14 @@ class DecoderBlock(nn.Module):
         hidden_states = self.mlp_down_proj(hidden_states) + mlp_residual
         return hidden_states
 
-    def forward_iteration(self, hidden_states, items, paged_attn_manager: PagedAttention):
+    def forward_iteration(self, hidden_states, items, paged_attn_manager: PagedAttention, decode_metadata=None):
         attention_residual = hidden_states
         attention_output, prefill_kv = self.self_attn.forward_iteration(
             self.input_layernorm(hidden_states),
             items,
             self.layer_id,
             paged_attn_manager,
+            decode_metadata,
         )
         hidden_states = attention_output + attention_residual
 
@@ -247,8 +252,18 @@ class PagedDecoderLM(nn.Module):
         position_ids = torch.tensor(position_ids, dtype=torch.long, device=input_ids.device).unsqueeze(1)
         hidden_states = self.embedding_helper(input_ids, position_ids)
 
+        # Block tables and lengths depend on the iteration, not the layer. Build
+        # them once and retain the same device tensors throughout the layer loop.
+        decode_metadata = kv_manager.build_decode_metadata(request_ids)
+
         for layer in self.layers:
-            hidden_states = layer.decode(hidden_states, request_ids, kv_manager, paged_attn_manager)
+            hidden_states = layer.decode(
+                hidden_states,
+                request_ids,
+                kv_manager,
+                paged_attn_manager,
+                decode_metadata,
+            )
 
         logits = self.output_layer(self.final_layernorm(hidden_states))  # [B,T,vocab_size]
 
@@ -293,9 +308,23 @@ class PagedDecoderLM(nn.Module):
 
         hidden_states = self.embedding_helper(iteration_batch.input_ids, iteration_batch.position_ids)
 
+        decode_request_ids = [
+            item.request_id for item in iteration_batch.items if item.phase == "decode"
+        ]
+        decode_metadata = (
+            kv_manager.build_decode_metadata(decode_request_ids)
+            if decode_request_ids
+            else None
+        )
+
         for layer in self.layers:
             # Entire flattened tensor then passes through every decoder layer
-            hidden_states, layer_prefill_kv = layer.forward_iteration(hidden_states, iteration_batch.items, paged_attn_manager)
+            hidden_states, layer_prefill_kv = layer.forward_iteration(
+                hidden_states,
+                iteration_batch.items,
+                paged_attn_manager,
+                decode_metadata,
+            )
             for request_id, key_value in layer_prefill_kv.items():
                 prefill_cache[request_id].append(key_value)
 
@@ -322,7 +351,6 @@ class PagedDecoderLM(nn.Module):
                 kv_manager.commit_token(item.request_id)
 
         return logits
-
 
 
 

@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">Paged KV cache allocation</title>
+  <desc id="desc">Three requests map their ordered logical blocks onto non-contiguous physical blocks in a shared cache pool. Free blocks can be reused as soon as a request completes.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fbfcff"/><stop offset="1" stop-color="#eef3ff"/></linearGradient>
+    <marker id="blueArrow" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#4263eb"/></marker>
+    <style>
+      .title{font:700 34px Inter,Arial,sans-serif;fill:#132238}.subtitle{font:400 17px Inter,Arial,sans-serif;fill:#52637a}
+      .label{font:700 18px Inter,Arial,sans-serif;fill:#132238}.small{font:500 14px Inter,Arial,sans-serif;fill:#52637a}.id{font:700 17px Inter,Arial,sans-serif;fill:#fff}
+      .map{stroke:#4263eb;stroke-width:3;fill:none;marker-end:url(#blueArrow);opacity:.8}
+    </style>
+  </defs>
+  <rect width="1200" height="620" rx="28" fill="url(#background)"/>
+  <text x="60" y="64" class="title">Paged KV cache: logical order, flexible placement</text>
+  <text x="60" y="96" class="subtitle">Each square represents one 16-token block; color identifies the owning request.</text>
+
+  <rect x="55" y="145" width="425" height="405" rx="22" fill="#fff" stroke="#c8d6f0" stroke-width="2"/>
+  <text x="85" y="185" class="label">Per-request block tables</text>
+
+  <text x="85" y="245" class="label">Request A</text>
+  <rect x="220" y="214" width="64" height="54" rx="10" fill="#4263eb"/><rect x="300" y="214" width="64" height="54" rx="10" fill="#4263eb"/><rect x="380" y="214" width="64" height="54" rx="10" fill="#4263eb"/>
+  <text x="252" y="247" text-anchor="middle" class="id">0</text><text x="332" y="247" text-anchor="middle" class="id">1</text><text x="412" y="247" text-anchor="middle" class="id">2</text>
+  <text x="220" y="290" class="small">logical token order →</text>
+
+  <text x="85" y="370" class="label">Request B</text>
+  <rect x="220" y="339" width="64" height="54" rx="10" fill="#f08c46"/><rect x="300" y="339" width="64" height="54" rx="10" fill="#f08c46"/>
+  <text x="252" y="372" text-anchor="middle" class="id">0</text><text x="332" y="372" text-anchor="middle" class="id">1</text>
+
+  <text x="85" y="474" class="label">Request C</text>
+  <rect x="220" y="443" width="64" height="54" rx="10" fill="#2f9e6f"/><rect x="300" y="443" width="64" height="54" rx="10" fill="#2f9e6f"/>
+  <text x="252" y="476" text-anchor="middle" class="id">0</text><text x="332" y="476" text-anchor="middle" class="id">1</text>
+
+  <rect x="545" y="145" width="600" height="405" rx="22" fill="#fff" stroke="#c8d6f0" stroke-width="2"/>
+  <text x="575" y="185" class="label">Shared physical block pool</text>
+  <text x="575" y="212" class="small">Blocks do not need to be contiguous in memory.</text>
+
+  <g transform="translate(590 250)">
+    <rect x="0" y="0" width="94" height="72" rx="12" fill="#4263eb"/><rect x="112" y="0" width="94" height="72" rx="12" fill="#eef1f5" stroke="#b8c1cc" stroke-width="2" stroke-dasharray="7 6"/>
+    <rect x="224" y="0" width="94" height="72" rx="12" fill="#2f9e6f"/><rect x="336" y="0" width="94" height="72" rx="12" fill="#f08c46"/><rect x="448" y="0" width="94" height="72" rx="12" fill="#4263eb"/>
+    <rect x="0" y="92" width="94" height="72" rx="12" fill="#f08c46"/><rect x="112" y="92" width="94" height="72" rx="12" fill="#4263eb"/><rect x="224" y="92" width="94" height="72" rx="12" fill="#eef1f5" stroke="#b8c1cc" stroke-width="2" stroke-dasharray="7 6"/>
+    <rect x="336" y="92" width="94" height="72" rx="12" fill="#2f9e6f"/><rect x="448" y="92" width="94" height="72" rx="12" fill="#eef1f5" stroke="#b8c1cc" stroke-width="2" stroke-dasharray="7 6"/>
+    <text x="47" y="44" text-anchor="middle" class="id">A0</text><text x="159" y="44" text-anchor="middle" class="small">free</text><text x="271" y="44" text-anchor="middle" class="id">C0</text><text x="383" y="44" text-anchor="middle" class="id">B0</text><text x="495" y="44" text-anchor="middle" class="id">A1</text>
+    <text x="47" y="136" text-anchor="middle" class="id">B1</text><text x="159" y="136" text-anchor="middle" class="id">A2</text><text x="271" y="136" text-anchor="middle" class="small">free</text><text x="383" y="136" text-anchor="middle" class="id">C1</text><text x="495" y="136" text-anchor="middle" class="small">free</text>
+    <text x="47" y="190" text-anchor="middle" class="small">0</text><text x="159" y="190" text-anchor="middle" class="small">1</text><text x="271" y="190" text-anchor="middle" class="small">2</text><text x="383" y="190" text-anchor="middle" class="small">3</text><text x="495" y="190" text-anchor="middle" class="small">4</text>
+    <text x="-18" y="44" text-anchor="end" class="small">row 0</text><text x="-18" y="136" text-anchor="end" class="small">row 1</text>
+  </g>
+
+  <text x="845" y="493" text-anchor="middle" class="label">Completion → blocks return to the free list</text>
+</svg>

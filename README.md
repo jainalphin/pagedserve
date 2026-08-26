@@ -4,6 +4,37 @@ A PyTorch LLM inference engine with continuous batching and a paged KV cache.
 
 PagedServe combines new prompts and active generation requests in each model iteration. The KV cache is stored in reusable fixed-size blocks, reducing wasted memory and allowing completed requests to release memory immediately.
 
+## Paged decode attention
+
+During single-token decode, each request owns a logical sequence of 16-token KV
+pages. Its block table maps logical page `j` to an arbitrary physical page; pages
+do not need to be adjacent. The Torch backend gathers those pages into padded,
+contiguous K/V tensors and calls SDPA. The Triton backend launches one program per
+request and attention head, follows the table inside the kernel, and reads K/V
+directly from non-contiguous physical pages. No context-sized K/V tensor is
+materialized.
+
+The block table and context-length tensors describe an iteration, not a model
+layer. PagedServe builds them once after reserving decode slots and passes the same
+tensors through layers 0 through `L-1`.
+
+For each page, the Triton kernel updates online-softmax state. Given previous
+state `(m, l, a)` and page scores `s_i` with values `v_i`:
+
+```text
+m' = max(m, max_i(s_i))
+p_i = exp(s_i - m')
+alpha = exp(m - m')
+l' = alpha l + sum_i(p_i)
+a' = alpha a + sum_i(p_i v_i)
+output = a' / l'
+```
+
+The query, scores, running maximum, normalization sum, and value accumulator use
+FP32 inside the kernel. This prevents long reductions from accumulating in FP16
+and keeps rescaling stable when scores have a large dynamic range; the final
+output is cast back to the query dtype.
+
 ## Supported models
 
 | Model | Weights | Tokenizer |
@@ -25,6 +56,20 @@ source .venv/bin/activate
 ```
 
 The first run of each pretrained model downloads and caches its weights from Hugging Face. CUDA is used automatically when available; otherwise, the model runs on CPU.
+
+Triton is optional and requires an NVIDIA CUDA environment:
+
+```bash
+pip install -r requirements-triton.txt
+PYTHONPATH=. python main.py \
+  --model gpt2 --dtype float16 \
+  --decode-attention-backend triton
+```
+
+Supported Triton query/output dtypes are FP16, BF16, and FP32. Floating-point KV
+storage must match the query dtype. Head dimensions up to 256 and power-of-two KV
+page sizes are supported; the engine uses 16-token pages. Triton decode is
+CUDA-only, single-device self-attention decode, not prefill or training.
 
 ## Run the web interface
 
@@ -113,6 +158,98 @@ print(results[second])
 ```
 
 ## Run benchmarks
+
+### Correctness and kernel microbenchmark
+
+The CUDA correctness gate compares Torch gather+SDPA with Triton for FP16 and
+FP32; contexts 1, 15, 16, 17, 31, 32, 33, 128, 512, and 1024; batches 1, 8, and
+32; randomized non-contiguous physical pages; and layers 0, 1, and last. It also
+checks finite outputs, rejects NaN/Inf queries, and rejects zero/oversized lengths
+and out-of-range page IDs.
+
+```bash
+PYTHONPATH=. python -m pytest -q testing/test_triton_correctness_matrix.py
+
+PYTHONPATH=. python benchmark_paged_attention.py \
+  --dtype float16 --warmup 25 --iterations 100 \
+  --json-output artifacts/paged-attention-fp16.json
+
+PYTHONPATH=. python benchmark_paged_attention.py \
+  --dtype float32 --warmup 25 --iterations 100 \
+  --json-output artifacts/paged-attention-fp32.json
+```
+
+The microbenchmark reports latency in microseconds and peak temporary allocated
+GPU memory for every batch × context cell. Both paths share randomized block
+tables, and every measured cell is correctness-checked first.
+
+### Identical GPT-2 end-to-end comparison
+
+This driver runs each configuration in a fresh process at least three times. Both
+backends receive the same model, token-ID prompts, greedy decoding, burst arrival
+trace, scheduler, batch size, input length, and output length. Each published row
+is the median of isolated runs.
+
+```bash
+PYTHONPATH=. python benchmark_decode_backends.py \
+  --dtype float16 \
+  --batch-sizes 1,8,32 \
+  --input-lengths 128,512 \
+  --output-length 32 \
+  --runs 3 \
+  --output artifacts/gpt2-decode-backends.json
+```
+
+| Backend | Batch | Input | Output tok/s (median) | TPOT ms (median) | TTFT ms (median) | Peak GPU MiB (median) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Torch | 1/8/32 | 128/512 | Not measured here | Not measured here | Not measured here | Not measured here |
+| Triton | 1/8/32 | 128/512 | Not measured here | Not measured here | Not measured here | Not measured here |
+
+This checkout was developed in a CPU-only environment, so CUDA numbers and a
+trace are deliberately not fabricated. The commands write all raw runs and the
+median table; publish the generated JSON alongside filled results, including
+cells where Triton loses.
+
+### Profiling evidence
+
+Capture one PyTorch Profiler Chrome trace with named regions for metadata
+construction, Torch KV-gather allocations plus SDPA, and Triton's direct reads:
+
+```bash
+PYTHONPATH=. python profile_paged_attention.py \
+  --batch-size 8 --context-length 512 --iterations 10 \
+  --trace artifacts/paged-attention-trace.json
+```
+
+Open it in Perfetto or `chrome://tracing`.
+`torch_kv_gather_allocations_plus_sdpa` exposes context-sized allocation/copy
+kernels, `triton_direct_noncontiguous_paged_reads` contains the fused kernel, and
+`metadata_construction_once_per_iteration` exposes metadata CPU/device-copy cost.
+The trace also provides launch duration and the dominant kernel bottlenecks.
+
+### INT8 KV-cache extension
+
+INT8 is the only advanced extension. Each K and V vector uses symmetric
+per-token/per-head quantization, `q = round(clamp(x / scale, -127, 127))`, with an
+FP32 scale. Triton loads INT8 values from the paged pool and applies the scale in
+registers before the dot product or weighted-value reduction. Torch dequantizes
+after gather as the reference path.
+
+```bash
+PYTHONPATH=. python main.py \
+  --model gpt2 --dtype float16 \
+  --decode-attention-backend triton \
+  --kv-cache-dtype int8
+
+PYTHONPATH=. python evaluate_int8_kv.py \
+  --tokens 128 --prefix-tokens 32 --iterations 100 \
+  --output artifacts/int8-kv-evaluation.json
+```
+
+The evaluation records usable token capacity under the same byte budget, FP16
+versus INT8 Triton decode latency, mean/maximum logit error, and deterministic
+proxy-perplexity delta. The included text is an engineering proxy, not a named
+corpus benchmark.
 
 Benchmark every supported model:
 

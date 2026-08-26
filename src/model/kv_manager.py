@@ -3,7 +3,7 @@ import math
 import torch
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Union, Optional, Set
+from typing import Dict, Hashable, List, Tuple, Union, Optional, Set
 
 
 @dataclass
@@ -15,17 +15,43 @@ class RequestInfo:
     reserved_block_offset: Optional[int] = None
     written_layer_ids: Set[int] = field(default_factory=set)
 
+
+@dataclass(frozen=True)
+class DecodeMetadata:
+    """Device metadata shared by every attention layer in one decode iteration."""
+
+    request_ids: Tuple[Hashable, ...]
+    block_table: torch.Tensor
+    context_lengths: torch.Tensor
+    maximum_context_length: int
+
 class KVCacheManager:
     def __init__(self, block_size, total_memory, tensor_dtype, device,
-                 num_layers, num_kv_heads, head_dim):
+                 num_layers, num_kv_heads, head_dim, cache_dtype=None):
         self.block_size = block_size
         self.total_memory = total_memory
         self.tensor_dtype = tensor_dtype
+        self.cache_dtype = cache_dtype or tensor_dtype
+        if self.cache_dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.int8,
+        ):
+            raise ValueError("KV cache dtype must be FP16, BF16, FP32, or INT8")
         self.device = device
 
         # 2 × layers × KV heads × block size × head dimension × bytes per element
-        bytes_per_element = torch.empty(0, dtype=self.tensor_dtype).element_size()
-        self.bytes_per_block = 2 * num_layers * num_kv_heads * block_size * head_dim * bytes_per_element
+        bytes_per_element = torch.empty(0, dtype=self.cache_dtype).element_size()
+        scale_bytes = 0
+        if self.cache_dtype == torch.int8:
+            # One FP32 symmetric scale per layer, physical block, head and token,
+            # independently for K and V.
+            scale_bytes = 2 * num_layers * num_kv_heads * block_size * 4
+        self.bytes_per_block = (
+            2 * num_layers * num_kv_heads * block_size * head_dim * bytes_per_element
+            + scale_bytes
+        )
         self.total_available_blocks = self.total_memory // self.bytes_per_block
 
         if self.total_available_blocks == 0:
@@ -50,10 +76,35 @@ class KVCacheManager:
             self.head_dim
         )
 
-        self.key_pool = torch.empty(pool_shape, dtype=self.tensor_dtype, device=self.device)
-        self.value_pool = torch.empty(pool_shape, dtype=self.tensor_dtype, device=self.device)
+        self.key_pool = torch.empty(pool_shape, dtype=self.cache_dtype, device=self.device)
+        self.value_pool = torch.empty(pool_shape, dtype=self.cache_dtype, device=self.device)
+        if self.cache_dtype == torch.int8:
+            scale_shape = pool_shape[:-1]
+            self.key_scale_pool = torch.empty(
+                scale_shape, dtype=torch.float32, device=self.device
+            )
+            self.value_scale_pool = torch.empty(
+                scale_shape, dtype=torch.float32, device=self.device
+            )
+        else:
+            # A real device pointer keeps the Triton call signature identical;
+            # the compile-time KV_QUANTIZED branch never loads these tensors.
+            self.key_scale_pool = torch.empty(1, dtype=torch.float32, device=self.device)
+            self.value_scale_pool = torch.empty(1, dtype=torch.float32, device=self.device)
 
         self.requests = defaultdict(RequestInfo)
+
+    @property
+    def is_quantized(self):
+        return self.cache_dtype == torch.int8
+
+    @staticmethod
+    def _quantize_vectors(tensor):
+        values = tensor.to(torch.float32)
+        scale = values.abs().amax(dim=-1) / 127.0
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        quantized = torch.round(values / scale.unsqueeze(-1)).clamp(-127, 127)
+        return quantized.to(torch.int8), scale
 
     def allocate_block(self):
         if not self.free_blocks:
@@ -132,8 +183,16 @@ class KVCacheManager:
         reserved_block_id = request_info.reserved_block_id
         reserved_block_offset = request_info.reserved_block_offset
 
-        self.key_pool[layer_id, reserved_block_id, :, reserved_block_offset, :] = new_key
-        self.value_pool[layer_id, reserved_block_id, :, reserved_block_offset, :] = new_value
+        if self.is_quantized:
+            quantized_key, key_scale = self._quantize_vectors(new_key)
+            quantized_value, value_scale = self._quantize_vectors(new_value)
+            self.key_pool[layer_id, reserved_block_id, :, reserved_block_offset, :] = quantized_key
+            self.value_pool[layer_id, reserved_block_id, :, reserved_block_offset, :] = quantized_value
+            self.key_scale_pool[layer_id, reserved_block_id, :, reserved_block_offset] = key_scale
+            self.value_scale_pool[layer_id, reserved_block_id, :, reserved_block_offset] = value_scale
+        else:
+            self.key_pool[layer_id, reserved_block_id, :, reserved_block_offset, :] = new_key
+            self.value_pool[layer_id, reserved_block_id, :, reserved_block_offset, :] = new_value
         request_info.written_layer_ids.add(layer_id)
 
 
@@ -219,6 +278,9 @@ class KVCacheManager:
             [layer_value for _, layer_value in layer_kv_cache],
             dim=0,
         )
+        if self.is_quantized:
+            stacked_keys, stacked_key_scales = self._quantize_vectors(stacked_keys)
+            stacked_values, stacked_value_scales = self._quantize_vectors(stacked_values)
 
         first_logical_block = start_position // self.block_size
         last_logical_block = (end_position - 1) // self.block_size
@@ -238,6 +300,13 @@ class KVCacheManager:
             self.value_pool[
                 :, physical_block, :, block_offset:block_end, :
             ] = stacked_values[:, :, source_start:source_end, :]
+            if self.is_quantized:
+                self.key_scale_pool[
+                    :, physical_block, :, block_offset:block_end
+                ] = stacked_key_scales[:, :, source_start:source_end]
+                self.value_scale_pool[
+                    :, physical_block, :, block_offset:block_end
+                ] = stacked_value_scales[:, :, source_start:source_end]
 
         request_info.sequence_length = end_position
 
@@ -301,6 +370,11 @@ class KVCacheManager:
         block_ids = torch.tensor(block_ids, dtype=torch.long, device=self.key_pool.device)
         block_offsets = torch.tensor(block_offsets, dtype=torch.long, device=self.key_pool.device)
 
+        if self.is_quantized:
+            new_keys, key_scales = self._quantize_vectors(new_keys)
+            new_values, value_scales = self._quantize_vectors(new_values)
+            self.key_scale_pool[layer_id, block_ids, :, block_offsets] = key_scales
+            self.value_scale_pool[layer_id, block_ids, :, block_offsets] = value_scales
         self.key_pool[layer_id, block_ids, :, block_offsets, :] = new_keys # [batch_size, heads, head_dim]
         self.value_pool[layer_id, block_ids, :, block_offsets, :] = new_values # [batch_size, heads, head_dim]
 
@@ -345,6 +419,14 @@ class KVCacheManager:
         layer_key = layer_key.reshape(self.num_kv_heads, -1, self.head_dim)
         layer_value = layer_value.reshape(self.num_kv_heads, -1, self.head_dim)
 
+        if self.is_quantized:
+            key_scales = self.key_scale_pool[layer_id, block_ids].permute(1, 0, 2)
+            value_scales = self.value_scale_pool[layer_id, block_ids].permute(1, 0, 2)
+            key_scales = key_scales.reshape(self.num_kv_heads, -1, 1)
+            value_scales = value_scales.reshape(self.num_kv_heads, -1, 1)
+            layer_key = layer_key.to(self.tensor_dtype) * key_scales.to(self.tensor_dtype)
+            layer_value = layer_value.to(self.tensor_dtype) * value_scales.to(self.tensor_dtype)
+
         layer_key = layer_key[:, :request_info.sequence_length, :]
         layer_value = layer_value[:, :request_info.sequence_length, :]
 
@@ -353,13 +435,20 @@ class KVCacheManager:
 
         return layer_key, layer_value
 
-    def build_decode_metadata(self, request_ids, layer_id):
+    def validate_decode_layer(self, request_ids, layer_id):
+        if not 0 <= layer_id < self.num_layers:
+            raise ValueError("Invalid layer_id")
+        for request_id in request_ids:
+            if layer_id not in self.requests[request_id].written_layer_ids:
+                raise RuntimeError(
+                    f"Request {request_id} has not written layer {layer_id}"
+                )
+
+    def build_decode_metadata(self, request_ids, layer_id=None):
         if not request_ids:
             raise ValueError("request_ids cannot be empty")
         if len(request_ids) != len(set(request_ids)):
             raise ValueError("request_ids must be unique")
-        if not 0 <= layer_id < self.num_layers:
-            raise ValueError("Invalid layer_id")
 
         request_infos = []
         for request_id in request_ids:
@@ -369,17 +458,17 @@ class KVCacheManager:
         for request_id, request_info in zip(request_ids, request_infos):
             if request_info.reserved_position is None:
                 raise RuntimeError(f"Request {request_id} has no reserved decode token")
-            if layer_id not in request_info.written_layer_ids:
-                raise RuntimeError(
-                    f"Request {request_id} has not written layer {layer_id}"
-                )
             if not request_info.block_ids:
                 raise RuntimeError(f"Request {request_id} has no KV blocks")
+
+        if layer_id is not None:
+            self.validate_decode_layer(request_ids, layer_id)
 
         block_ids = [request_info.block_ids for request_info in request_infos]
         context_lengths = [
             request_info.sequence_length + 1 for request_info in request_infos
         ]
+        maximum_context_length = max(context_lengths)
         max_blocks = max(len(ids) for ids in block_ids)
 
         block_ids = [
@@ -398,9 +487,14 @@ class KVCacheManager:
             device=self.key_pool.device,
         )
 
-        return block_table, context_lengths
+        return DecodeMetadata(
+            request_ids=tuple(request_ids),
+            block_table=block_table,
+            context_lengths=context_lengths,
+            maximum_context_length=maximum_context_length,
+        )
 
-    def gather_decode_layer_batch(self, request_ids, layer_id):
+    def gather_decode_layer_batch(self, request_ids, layer_id, metadata=None):
         """Gather variable-length decode contexts with one batched pool lookup."""
         if not request_ids:
             raise ValueError("request_ids cannot be empty")
@@ -418,21 +512,11 @@ class KVCacheManager:
             if not request_info.block_ids:
                 raise RuntimeError(f"Request {request_id} has no KV blocks")
 
-        context_lengths = [
-            request_info.sequence_length + 1 for request_info in request_infos
-        ]
-        maximum_blocks = max(len(request_info.block_ids) for request_info in request_infos)
-        block_table = [
-            request_info.block_ids
-            + [request_info.block_ids[-1]]
-            * (maximum_blocks - len(request_info.block_ids))
-            for request_info in request_infos
-        ]
-        block_table = torch.tensor(
-            block_table,
-            dtype=torch.long,
-            device=self.key_pool.device,
-        )
+        if metadata is None:
+            metadata = self.build_decode_metadata(request_ids, layer_id)
+        elif metadata.request_ids != tuple(request_ids):
+            raise ValueError("Decode metadata request order does not match")
+        block_table = metadata.block_table.to(torch.long)
 
         # [batch, blocks, heads, block, dim] -> [batch, heads, tokens, dim]
         keys = self.key_pool[layer_id, block_table].permute(0, 2, 1, 3, 4)
@@ -440,14 +524,18 @@ class KVCacheManager:
         keys = keys.reshape(len(request_ids), self.num_kv_heads, -1, self.head_dim)
         values = values.reshape(len(request_ids), self.num_kv_heads, -1, self.head_dim)
 
-        maximum_context = max(context_lengths)
+        if self.is_quantized:
+            key_scales = self.key_scale_pool[layer_id, block_table].permute(0, 2, 1, 3)
+            value_scales = self.value_scale_pool[layer_id, block_table].permute(0, 2, 1, 3)
+            key_scales = key_scales.reshape(len(request_ids), self.num_kv_heads, -1, 1)
+            value_scales = value_scales.reshape(len(request_ids), self.num_kv_heads, -1, 1)
+            keys = keys.to(self.tensor_dtype) * key_scales.to(self.tensor_dtype)
+            values = values.to(self.tensor_dtype) * value_scales.to(self.tensor_dtype)
+
+        maximum_context = metadata.maximum_context_length
         keys = keys[:, :, :maximum_context, :]
         values = values[:, :, :maximum_context, :]
-        length_tensor = torch.tensor(
-            context_lengths,
-            dtype=torch.long,
-            device=self.key_pool.device,
-        )
+        length_tensor = metadata.context_lengths.to(torch.long)
         valid_positions = torch.arange(
             maximum_context,
             device=self.key_pool.device,

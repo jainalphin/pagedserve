@@ -31,6 +31,7 @@ from main import (
     GPT2_MODEL,
     SUPPORTED_DECODE_ATTENTION_BACKENDS,
     SUPPORTED_DTYPES,
+    SUPPORTED_KV_CACHE_DTYPES,
     build_scheduler,
 )
 
@@ -954,6 +955,11 @@ def parse_args():
         choices=SUPPORTED_DECODE_ATTENTION_BACKENDS,
         default="torch",
     )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=SUPPORTED_KV_CACHE_DTYPES,
+        default="model",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--telemetry-interval-ms", type=positive_integer, default=200)
@@ -1035,6 +1041,7 @@ def base_report(args, input_lengths, output_lengths):
             "prefill_chunk_size": args.prefill_chunk_size,
             "pagedserve_strategy": args.pagedserve_strategy,
             "decode_attention_backend": args.decode_attention_backend,
+            "kv_cache_dtype": args.kv_cache_dtype,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "vllm_enforce_eager": args.vllm_enforce_eager,
             "ttft_slo_ms": args.ttft_slo_ms,
@@ -1074,6 +1081,7 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
         kv_cache_safety_mb=args.kv_cache_safety_mb,
         execution_dtype=args.dtype,
         decode_attention_backend=args.decode_attention_backend,
+        kv_cache_dtype=args.kv_cache_dtype,
     )
     synchronize_cuda()
     initialization_seconds = time.perf_counter() - initialization_start
@@ -1086,6 +1094,7 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
     report["engine_metadata"] = {
         "policy": "continuous_batching",
         "decode_attention_backend": args.decode_attention_backend,
+        "kv_cache_dtype": args.kv_cache_dtype,
         "model_dtype": str(next(scheduler.model_engine.parameters()).dtype),
         "initialization_seconds": initialization_seconds,
         "warmup_seconds": warmup_seconds,

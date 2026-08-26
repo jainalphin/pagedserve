@@ -3,7 +3,7 @@ from typing import Dict, Sequence, Tuple
 import torch
 from torch.nn import functional as F
 from src.model.iteration import IterationItem
-from src.model.kv_manager import KVCacheManager
+from src.model.kv_manager import DecodeMetadata, KVCacheManager
 
 
 class PagedAttention:
@@ -43,6 +43,13 @@ class PagedAttention:
         attention_scores = []
         for physical_block_id, valid_tokens in zip(physical_blocks, valid_token_size):
             key_block = self.kv_manager.key_pool[layer_id, physical_block_id, :, :valid_tokens, :]
+            if self.kv_manager.is_quantized:
+                key_scale = self.kv_manager.key_scale_pool[
+                    layer_id, physical_block_id, :, :valid_tokens
+                ]
+                key_block = (
+                    key_block.to(query.dtype) * key_scale.to(query.dtype).unsqueeze(-1)
+                )
             # before: [heads, valid_tokens, head_dim]
             # after:  [heads, head_dim, valid_tokens]
             key_block = key_block.transpose(-2, -1)
@@ -70,6 +77,14 @@ class PagedAttention:
         for physical_block_id, valid_tokens in zip(physical_blocks, valid_token_size):
 
             value_block = self.kv_manager.value_pool[layer_id, physical_block_id, :, :valid_tokens, :] # [heads, valid_tokens, head_dim]
+            if self.kv_manager.is_quantized:
+                value_scale = self.kv_manager.value_scale_pool[
+                    layer_id, physical_block_id, :, :valid_tokens
+                ]
+                value_block = (
+                    value_block.to(attention_scores.dtype)
+                    * value_scale.to(attention_scores.dtype).unsqueeze(-1)
+                )
             block_prob = softmax_probabilities[:, start:start + valid_tokens] # [heads, valid_tokens]
             block_prob = block_prob.unsqueeze(1) # [heads, 1, valid_tokens]
             weighted_sum = torch.matmul(block_prob, value_block).squeeze(dim=1)
@@ -83,7 +98,13 @@ class PagedAttention:
         return self.compute_weighted_value_sum(request_id, layer_id, attention_score)
 
 
-    def forward_batch(self, request_ids, layer_id, queries):
+    def forward_batch(
+        self,
+        request_ids,
+        layer_id,
+        queries,
+        decode_metadata: DecodeMetadata = None,
+    ):
         if not request_ids:
             return None
 
@@ -93,6 +114,12 @@ class PagedAttention:
         batch_size = len(request_ids)
         assert queries.shape == (batch_size, self.num_kv_heads, self.head_dim)
 
+        if decode_metadata is None:
+            decode_metadata = self.kv_manager.build_decode_metadata(request_ids)
+        elif decode_metadata.request_ids != tuple(request_ids):
+            raise ValueError("Decode metadata request order does not match")
+        self.kv_manager.validate_decode_layer(request_ids, layer_id)
+
         if self.decode_attention_backend == "triton":
             # Keep Triton optional: importing it is only necessary when this
             # backend is selected on a CUDA system.
@@ -100,22 +127,22 @@ class PagedAttention:
                 paged_decode_attention_triton,
             )
 
-            block_table, context_lengths = self.kv_manager.build_decode_metadata(
-                request_ids,
-                layer_id,
-              )
             return paged_decode_attention_triton(
                 queries,
                 self.kv_manager.key_pool,
                 self.kv_manager.value_pool,
-                block_table,
-                context_lengths,
+                self.kv_manager.key_scale_pool,
+                self.kv_manager.value_scale_pool,
+                decode_metadata.block_table,
+                decode_metadata.context_lengths,
                 layer_id,
+                validate_inputs=False,
             )
 
         keys, values, valid_positions = self.kv_manager.gather_decode_layer_batch(
             request_ids,
             layer_id,
+            decode_metadata,
         )
         attention_mask = valid_positions[:, None, None, :]
         output = F.scaled_dot_product_attention(
@@ -185,6 +212,7 @@ class PagedAttention:
         queries: torch.Tensor,
         keys: torch.Tensor,
         values: torch.Tensor,
+        decode_metadata: DecodeMetadata = None,
     ) -> Tuple[torch.Tensor, Dict[object, Tuple[torch.Tensor, torch.Tensor]]]:
         expected_shape = (queries.shape[0], self.num_kv_heads, self.head_dim)
         if queries.shape != expected_shape:
@@ -214,6 +242,7 @@ class PagedAttention:
                 decode_request_ids,
                 layer_id,
                 decode_queries,
+                decode_metadata=decode_metadata,
             )
             decode_offsets = torch.tensor(
                 decode_offsets,

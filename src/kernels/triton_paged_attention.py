@@ -10,6 +10,8 @@ def _paged_decode_attention_kernel(
     queries,
     key_pool,
     value_pool,
+    key_scales,
+    value_scales,
     block_table,
     context_lengths,
     output,
@@ -28,6 +30,14 @@ def _paged_decode_attention_kernel(
     value_stride_head,
     value_stride_token,
     value_stride_dim,
+    key_scale_stride_layer,
+    key_scale_stride_block,
+    key_scale_stride_head,
+    key_scale_stride_token,
+    value_scale_stride_layer,
+    value_scale_stride_block,
+    value_scale_stride_head,
+    value_scale_stride_token,
     table_stride_batch,
     table_stride_block,
     context_length_stride,
@@ -37,6 +47,7 @@ def _paged_decode_attention_kernel(
     KV_BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PADDED_HEAD_DIM: tl.constexpr,
+    KV_QUANTIZED: tl.constexpr,
 ):
     """Compute one decode-attention output for each request and head."""
     request_index = tl.program_id(0)
@@ -98,6 +109,19 @@ def _paged_decode_attention_kernel(
             mask=key_mask,
             other=0.0,
         ).to(tl.float32)
+        if KV_QUANTIZED:
+            key_scale_offsets = (
+                layer_index_64 * key_scale_stride_layer
+                + physical_block_64 * key_scale_stride_block
+                + head_index * key_scale_stride_head
+                + token_offsets * key_scale_stride_token
+            )
+            key_scale = tl.load(
+                key_scales + key_scale_offsets,
+                mask=token_mask,
+                other=0.0,
+            ).to(tl.float32)
+            keys = keys * key_scale[:, None]
 
         scores = tl.sum(keys * query[None, :], axis=1) * scale
         scores = tl.where(token_mask, scores, -float("inf"))
@@ -119,6 +143,19 @@ def _paged_decode_attention_kernel(
             mask=key_mask,
             other=0.0,
         ).to(tl.float32)
+        if KV_QUANTIZED:
+            value_scale_offsets = (
+                layer_index_64 * value_scale_stride_layer
+                + physical_block_64 * value_scale_stride_block
+                + head_index * value_scale_stride_head
+                + token_offsets * value_scale_stride_token
+            )
+            value_scale = tl.load(
+                value_scales + value_scale_offsets,
+                mask=token_mask,
+                other=0.0,
+            ).to(tl.float32)
+            values = values * value_scale[:, None]
 
         accumulator = (
             accumulator * previous_correction
@@ -146,14 +183,24 @@ def paged_decode_attention_triton(
     queries: torch.Tensor,
     key_pool: torch.Tensor,
     value_pool: torch.Tensor,
+    key_scales: torch.Tensor,
+    value_scales: torch.Tensor,
     block_table: torch.Tensor,
     context_lengths: torch.Tensor,
     layer_id: int,
+    validate_inputs: bool = True,
 ) -> torch.Tensor:
     """Run fused paged attention for a batch of single-token decode queries."""
     if not queries.is_cuda:
         raise ValueError("Triton paged attention requires CUDA tensors")
-    tensors = (key_pool, value_pool, block_table, context_lengths)
+    tensors = (
+        key_pool,
+        value_pool,
+        key_scales,
+        value_scales,
+        block_table,
+        context_lengths,
+    )
     if any(tensor.device != queries.device for tensor in tensors):
         raise ValueError("All Triton paged-attention tensors must share one device")
     if queries.ndim != 3:
@@ -170,10 +217,21 @@ def paged_decode_attention_triton(
         raise ValueError("Decode metadata batch size does not match queries")
     if key_pool.shape[2] != num_heads or key_pool.shape[4] != head_dim:
         raise ValueError("Query heads and dimensions must match the KV cache")
-    if queries.dtype != key_pool.dtype or value_pool.dtype != key_pool.dtype:
-        raise ValueError("Queries and KV pools must have matching dtypes")
     if queries.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError("Triton paged attention requires a floating-point dtype")
+    if value_pool.dtype != key_pool.dtype:
+        raise ValueError("Key and value pools must have matching dtypes")
+    kv_quantized = key_pool.dtype == torch.int8
+    if not kv_quantized and queries.dtype != key_pool.dtype:
+        raise ValueError("Floating-point queries and KV pools must match dtypes")
+    if kv_quantized:
+        expected_scale_shape = key_pool.shape[:-1]
+        if key_scales.shape != expected_scale_shape or value_scales.shape != expected_scale_shape:
+            raise ValueError("INT8 scale pools must match KV pools without head_dim")
+        if key_scales.dtype != torch.float32 or value_scales.dtype != torch.float32:
+            raise ValueError("INT8 KV scales must use FP32")
+    elif key_pool.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("KV pools must use a supported floating-point dtype or INT8")
     if block_table.dtype not in (torch.int32, torch.int64):
         raise ValueError("Block table must use int32 or int64")
     if context_lengths.dtype not in (torch.int32, torch.int64):
@@ -187,6 +245,53 @@ def paged_decode_attention_triton(
     if kv_block_size <= 0 or kv_block_size & (kv_block_size - 1):
         raise ValueError("KV block size must be a power of two")
 
+    if validate_inputs:
+        lengths = context_lengths.to(torch.int64)
+        if bool((lengths <= 0).any().item()):
+            raise ValueError("Context lengths must be positive")
+        if bool((lengths > block_table.shape[1] * kv_block_size).any().item()):
+            raise ValueError("A context length exceeds its block-table capacity")
+        logical_columns = torch.arange(
+            block_table.shape[1], device=block_table.device
+        ).unsqueeze(0)
+        used_blocks = logical_columns < torch.div(
+            lengths + kv_block_size - 1, kv_block_size, rounding_mode="floor"
+        ).unsqueeze(1)
+        used_physical_blocks = block_table[used_blocks]
+        if bool(
+            (
+                (used_physical_blocks < 0)
+                | (used_physical_blocks >= key_pool.shape[1])
+            ).any().item()
+        ):
+            raise ValueError("Block table contains an invalid physical block ID")
+        max_context = int(lengths.max().item())
+        positions = torch.arange(max_context, device=block_table.device)
+        valid_tokens = positions.unsqueeze(0) < lengths.unsqueeze(1)
+        batch_indices = torch.arange(
+            batch_size, device=block_table.device
+        ).unsqueeze(1).expand_as(valid_tokens)[valid_tokens]
+        token_indices = positions.unsqueeze(0).expand_as(valid_tokens)[valid_tokens]
+        physical_indices = block_table[
+            batch_indices, token_indices // kv_block_size
+        ].to(torch.long)
+        block_offsets = token_indices % kv_block_size
+        if kv_quantized:
+            used_finite_tensors = (
+                key_scales[layer_id, physical_indices, :, block_offsets],
+                value_scales[layer_id, physical_indices, :, block_offsets],
+            )
+        else:
+            used_finite_tensors = (
+                key_pool[layer_id, physical_indices, :, block_offsets, :],
+                value_pool[layer_id, physical_indices, :, block_offsets, :],
+            )
+        if not bool(torch.isfinite(queries).all().item()) or any(
+            not bool(torch.isfinite(tensor).all().item())
+            for tensor in used_finite_tensors
+        ):
+            raise ValueError("Paged-attention inputs contain NaN or Inf")
+
     padded_head_dim = triton.next_power_of_2(head_dim)
     output = torch.empty(
         (batch_size, num_heads, head_dim),
@@ -194,11 +299,15 @@ def paged_decode_attention_triton(
         device=queries.device,
     )
     grid = (batch_size, num_heads)
+    key_scale_strides = key_scales.stride() if kv_quantized else (0, 0, 0, 0)
+    value_scale_strides = value_scales.stride() if kv_quantized else (0, 0, 0, 0)
 
     _paged_decode_attention_kernel[grid](
         queries,
         key_pool,
         value_pool,
+        key_scales,
+        value_scales,
         block_table,
         context_lengths,
         output,
@@ -207,12 +316,15 @@ def paged_decode_attention_triton(
         *queries.stride(),
         *key_pool.stride(),
         *value_pool.stride(),
+        *key_scale_strides,
+        *value_scale_strides,
         *block_table.stride(),
         *context_lengths.stride(),
         *output.stride(),
         KV_BLOCK_SIZE=kv_block_size,
         HEAD_DIM=head_dim,
         PADDED_HEAD_DIM=padded_head_dim,
+        KV_QUANTIZED=kv_quantized,
         num_warps=4,
     )
     return output
