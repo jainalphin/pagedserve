@@ -141,6 +141,7 @@ class PagedAttention:
         output: torch.Tensor = None,
         new_keys: torch.Tensor = None,
         new_values: torch.Tensor = None,
+        _trusted_decode_metadata: bool = False,
     ):
         if not request_ids:
             return None
@@ -153,7 +154,10 @@ class PagedAttention:
 
         if decode_metadata is None:
             decode_metadata = self.kv_manager.build_decode_metadata(request_ids)
-        elif decode_metadata.request_ids != tuple(request_ids):
+        elif (
+            not _trusted_decode_metadata
+            and decode_metadata.request_ids != tuple(request_ids)
+        ):
             raise ValueError("Decode metadata request order does not match")
         write_kv = new_keys is not None or new_values is not None
         if write_kv:
@@ -162,9 +166,11 @@ class PagedAttention:
             expected_kv_shape = (batch_size, self.num_kv_heads, self.head_dim)
             if new_keys.shape != expected_kv_shape or new_values.shape != expected_kv_shape:
                 raise ValueError("New K/V tensors must match the decode batch")
-            self.kv_manager.validate_reserved_layer_write(request_ids, layer_id)
+            if not _trusted_decode_metadata:
+                self.kv_manager.validate_reserved_layer_write(request_ids, layer_id)
         else:
-            self.kv_manager.validate_decode_layer(request_ids, layer_id)
+            if not _trusted_decode_metadata:
+                self.kv_manager.validate_decode_layer(request_ids, layer_id)
 
         if self.decode_attention_backend == "triton":
             # Keep Triton optional: importing it is only necessary when this

@@ -34,6 +34,8 @@ def one_run(args, backend, batch_size, input_length, repetition, destination):
         "--seed", str(args.seed),
         "--json-output", str(output),
     ]
+    if args.disable_cuda_graphs:
+        command.append("--disable-cuda-graphs")
     environment = os.environ.copy()
     environment["PYTHONPATH"] = "."
     subprocess.run(command, check=True, cwd=Path(__file__).parent, env=environment)
@@ -45,6 +47,7 @@ def one_run(args, backend, batch_size, input_length, repetition, destination):
         "tpot_ms": scenario["tpot_seconds"]["median"] * 1000,
         "ttft_ms": scenario["ttft_seconds"]["median"] * 1000,
         "peak_gpu_memory_mib": allocator["peak_allocated_bytes"] / 2**20,
+        "cuda_graphs": report["engine_metadata"].get("cuda_graphs"),
         "raw_report": str(output),
     }
 
@@ -59,6 +62,11 @@ def main():
     parser.add_argument("--output-length", type=int, default=32)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--disable-cuda-graphs",
+        action="store_true",
+        help="run the Triton eager ablation instead of CUDA-graph replay",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.runs < 3:

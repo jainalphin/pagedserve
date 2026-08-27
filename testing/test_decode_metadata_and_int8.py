@@ -137,6 +137,35 @@ def test_packed_decode_metadata_storage_is_reused_in_inference_mode():
     assert second.reserved_block_offsets.tolist() == [4]
 
 
+def test_metadata_stride_stays_stable_across_page_boundary():
+    manager = _manager()
+    manager.store_prefill_request(
+        "request",
+        [(torch.randn(2, 47, 8), torch.randn(2, 47, 8)) for _ in range(3)],
+    )
+    manager.reserve_token_slot("request")
+    with torch.inference_mode():
+        context_48 = manager.build_decode_metadata(["request"])
+        for layer_id in range(3):
+            manager.write_layer_kv_batch(
+                ["request"],
+                layer_id,
+                torch.randn(1, 2, 8),
+                torch.randn(1, 2, 8),
+                decode_metadata=context_48,
+            )
+        manager.commit_token("request")
+        manager.reserve_token_slot("request")
+        context_49 = manager.build_decode_metadata(["request"])
+    assert context_48.block_table.shape[1] == 3
+    assert context_49.block_table.shape[1] == 4
+    assert context_48.block_table.stride() == context_49.block_table.stride()
+    assert (
+        context_48.block_table.untyped_storage().data_ptr()
+        == context_49.block_table.untyped_storage().data_ptr()
+    )
+
+
 def test_int8_cache_increases_capacity_and_tracks_float_attention():
     torch.manual_seed(92)
     fp_manager = _manager(cache_dtype=torch.float32)

@@ -991,6 +991,11 @@ def parse_args():
         choices=SUPPORTED_KV_CACHE_DTYPES,
         default="model",
     )
+    parser.add_argument(
+        "--disable-cuda-graphs",
+        action="store_true",
+        help="disable PagedServe Triton CUDA graphs for an eager ablation",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument("--telemetry-interval-ms", type=positive_integer, default=200)
@@ -1083,6 +1088,7 @@ def base_report(args, input_lengths, output_lengths):
             "pagedserve_strategy": args.pagedserve_strategy,
             "decode_attention_backend": args.decode_attention_backend,
             "kv_cache_dtype": args.kv_cache_dtype,
+            "cuda_graphs_enabled": not args.disable_cuda_graphs,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "vllm_enforce_eager": args.vllm_enforce_eager,
             "ttft_slo_ms": args.ttft_slo_ms,
@@ -1123,6 +1129,7 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
         execution_dtype=args.dtype,
         decode_attention_backend=args.decode_attention_backend,
         kv_cache_dtype=args.kv_cache_dtype,
+        enable_cuda_graphs=not args.disable_cuda_graphs,
     )
     synchronize_cuda()
     initialization_seconds = time.perf_counter() - initialization_start
@@ -1163,6 +1170,7 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
         "cuda_allocator_snapshots": (
             scheduler.kv_manager.cuda_allocator_snapshots
         ),
+        "cuda_graphs": scheduler.model_engine.cuda_graph_summary(),
     }
     for request_rate in args.request_rate:
         records, duration, telemetry = run_pagedserve_scenario(
@@ -1173,6 +1181,9 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
             args,
         )
         add_summary(report, args, request_rate, records, duration, telemetry)
+        report["engine_metadata"]["cuda_graphs"] = (
+            scheduler.model_engine.cuda_graph_summary()
+        )
 
 
 def run_hf(args, tokenizer, model_config, prompts, output_lengths, report):

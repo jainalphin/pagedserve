@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--context-length", type=int, default=512)
     parser.add_argument("--warmup-decodes", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--disable-cuda-graphs", action="store_true")
     parser.add_argument("--trace", type=Path, required=True)
     args = parser.parse_args()
 
@@ -51,6 +52,7 @@ def main():
         max_batch_size=args.batch_size,
         execution_dtype=args.dtype,
         decode_attention_backend=args.backend,
+        enable_cuda_graphs=not args.disable_cuda_graphs,
     )
     scheduler.eos_token_id = None
     model_config = scheduler.model_engine.config
@@ -133,6 +135,7 @@ def main():
     profiler.export_chrome_trace(str(args.trace))
     print(profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=40))
     print(profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=40))
+    print(f"CUDA graphs: {scheduler.model_engine.cuda_graph_summary()}")
     print(f"Chrome trace: {args.trace}")
 
 

@@ -146,6 +146,7 @@ def build_scheduler(
     execution_dtype="float32",
     decode_attention_backend="torch",
     kv_cache_dtype="model",
+    enable_cuda_graphs=True,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if decode_attention_backend not in SUPPORTED_DECODE_ATTENTION_BACKENDS:
@@ -174,6 +175,7 @@ def build_scheduler(
         gpt2_model_id,
         distilgpt2_model_id,
     )
+    model.enable_cuda_graphs = enable_cuda_graphs
     after_model_memory = cuda_memory_snapshot(device)
     if max_batch_size is None:
         max_batch_size = 32 if device.type == "cuda" else 4
@@ -312,6 +314,11 @@ def main():
         default="model",
         help="KV storage dtype; int8 uses per-token/per-head symmetric scales",
     )
+    parser.add_argument(
+        "--disable-cuda-graphs",
+        action="store_true",
+        help="disable steady-state Triton decode CUDA-graph replay",
+    )
     args = parser.parse_args()
 
     scheduler = build_scheduler(
@@ -325,6 +332,7 @@ def main():
         execution_dtype=args.dtype,
         decode_attention_backend=args.decode_attention_backend,
         kv_cache_dtype=args.kv_cache_dtype,
+        enable_cuda_graphs=not args.disable_cuda_graphs,
     )
     first_request = scheduler.add_request("Paged attention", max_new_tokens=8)
     second_request = scheduler.add_request("Orca", max_new_tokens=8)

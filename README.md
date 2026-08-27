@@ -27,7 +27,12 @@ tensors through layers 0 through `L-1`. The metadata also contains the physical
 page IDs and in-page offsets reserved for the current tokens, so every layer can
 write its K/V vectors without reconstructing those device tensors. Block IDs,
 context lengths, reserved IDs, and reserved offsets are packed into one reusable
-device allocation and updated with one packed transfer per iteration.
+device allocation and updated with one packed transfer per iteration. Physical
+page-table rows use power-of-two storage buckets while exposing only live logical
+columns, keeping Triton specialization stable across ordinary page boundaries.
+Padding repeats page IDs only in this small metadata tensor; it does not allocate
+additional physical K/V pages. A sequence of length `T` still owns exactly
+`ceil(T / 16)` physical pages.
 
 The GPT-2 path uses one packed QKV projection per layer, reuses inference-only
 decode output/index buffers, and autotunes Triton warp/stage configurations for
@@ -36,7 +41,10 @@ measurements must follow warm-up so compilation and tuning are excluded.
 Decode-only iterations bypass per-layer request-object traversal. On the Triton
 path, attention residual addition and the following MLP LayerNorm are fused into
 one FP32-accumulating Triton kernel; mixed prefill/decode iterations retain the
-general scheduler path.
+general scheduler path. Steady decode batches of 1, 8, 16, or 32 capture the
+tensor-only transformer decode in CUDA Graphs and replay it while input and
+metadata storage addresses remain stable. Other batch sizes and capture failures
+fall back to eager execution. Use `--disable-cuda-graphs` for an eager ablation.
 
 For each page, the Triton kernel updates online-softmax state. Given previous
 state `(m, l, a)` and page scores `s_i` with values `v_i`:
@@ -268,7 +276,7 @@ The trace also provides launch duration and the dominant kernel bottlenecks.
 Profile the complete GPT-2 decode path when investigating the remaining gap to a
 production engine. This trace includes scheduler work, metadata construction,
 packed QKV and output projections, MLP projections, attention calls, allocator
-events, and CUDA kernel launches:
+events, CUDA Graph launches, and CUDA kernels:
 
 ```bash
 PYTHONPATH=. python profile_full_decode.py \
@@ -282,7 +290,9 @@ Run it once with `--backend torch` and once with `--backend triton`. Compare
 self-CPU time under `scheduler_plus_full_gpt2_decode_iteration`, CUDA time for
 `packed_qkv_projection`/MLP scopes, attention kernel duration, launch gaps, and
 memory events. This identifies where time is spent; it is not a throughput
-benchmark.
+benchmark. Add `--disable-cuda-graphs` to the Triton command and compare that
+trace with graph replay to isolate launch/dispatch savings. The command prints
+the number of captured graphs and any capture failure.
 
 On the measured T4 workload, Torch's gather path allocated 120 MiB cumulatively
 across 20 K/V index operations. The fused Triton kernel averaged 246.24 µs and
@@ -291,11 +301,13 @@ trace, outside the layer calls.
 
 ### INT8 KV-cache extension
 
-INT8 is the only advanced extension. Each K and V vector uses symmetric
-per-token/per-head quantization, `q = round(clamp(x / scale, -127, 127))`, with an
-FP32 scale. Triton loads INT8 values from the paged pool and applies the scale in
-registers before the dot product or weighted-value reduction. Torch dequantizes
-after gather as the reference path.
+INT8 is the only advanced extension and is an optional memory-capacity mode, not
+the default performance or vLLM-comparison configuration. Each K and V vector
+uses symmetric per-token/per-head quantization,
+`q = round(clamp(x / scale, -127, 127))`, with an FP32 scale. Triton loads INT8
+values from the paged pool and applies the scale in registers before the dot
+product or weighted-value reduction. Torch dequantizes after gather as the
+reference path.
 
 ```bash
 PYTHONPATH=. python main.py \

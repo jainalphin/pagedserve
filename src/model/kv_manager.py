@@ -418,7 +418,6 @@ class KVCacheManager:
 
     def mark_reserved_layer_written(self, request_ids, layer_id):
         """Record a successful device-side K/V write performed by Triton."""
-        self.validate_reserved_layer_write(request_ids, layer_id)
         for request_id in request_ids:
             self.requests[request_id].written_layer_ids.add(layer_id)
 
@@ -520,9 +519,10 @@ class KVCacheManager:
             raise ValueError("Decode token offsets cannot be negative")
         token_offsets_are_identity = token_offsets == tuple(range(len(request_ids)))
         max_blocks = max(len(ids) for ids in block_ids)
+        table_bucket = 1 << (max_blocks - 1).bit_length()
 
         block_ids = [
-            ids + [ids[-1]] * (max_blocks - len(ids)) for ids in block_ids
+            ids + [ids[-1]] * (table_bucket - len(ids)) for ids in block_ids
         ]
 
         packed_rows = [
@@ -552,10 +552,13 @@ class KVCacheManager:
             packed_metadata.copy_(packed_host, non_blocking=True)
         else:
             packed_metadata = packed_host.to(self.key_pool.device)
+        # Expose only real logical columns while retaining the bucketed row
+        # stride. This keeps Triton specialization and CUDA-graph addresses
+        # stable as requests cross ordinary page boundaries inside a bucket.
         block_table = packed_metadata[:, :max_blocks]
-        context_lengths = packed_metadata[:, max_blocks]
-        reserved_block_ids = packed_metadata[:, max_blocks + 1]
-        reserved_block_offsets = packed_metadata[:, max_blocks + 2]
+        context_lengths = packed_metadata[:, table_bucket]
+        reserved_block_ids = packed_metadata[:, table_bucket + 1]
+        reserved_block_offsets = packed_metadata[:, table_bucket + 2]
         offset_cache_key = (self.key_pool.device, token_offsets)
         token_offsets_tensor = self._decode_token_offset_cache.get(offset_cache_key)
         if token_offsets_tensor is None or not torch.is_inference_mode_enabled():

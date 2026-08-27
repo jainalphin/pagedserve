@@ -12,6 +12,20 @@ from src.model.kv_manager import KVCacheManager
 from src.model.paged_attention import PagedAttention
 
 
+CUDA_GRAPH_BATCH_SIZES = (1, 8, 16, 32)
+
+
+class DecodeCUDAGraph:
+    """Long-lived static tensors and replay object for one decode shape bucket."""
+
+    def __init__(self, graph, hidden_states, logits, decode_metadata):
+        self.graph = graph
+        self.hidden_states = hidden_states
+        self.logits = logits
+        self.decode_metadata = decode_metadata
+        self.replays = 0
+
+
 @dataclass
 class TransformerConfig:
     vocab_size: int = field(default=1000)
@@ -141,6 +155,7 @@ class PagedSelfAttention(nn.Module):
             decode_metadata=decode_metadata,
             new_keys=keys,
             new_values=values,
+            _trusted_decode_metadata=True,
         )
         return self.output_linear(self.merge_heads_flat(context))
 
@@ -267,7 +282,7 @@ class DecoderBlock(nn.Module):
 
 
 class PagedDecoderLM(nn.Module):
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, enable_cuda_graphs=True):
         super().__init__()
         self.config = config
         self.embedding_table = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -284,6 +299,9 @@ class PagedDecoderLM(nn.Module):
         )
         if config.tie_word_embeddings:
             self.output_layer.weight = self.embedding_table.weight
+        self.enable_cuda_graphs = enable_cuda_graphs
+        self._decode_cuda_graphs = {}
+        self._decode_cuda_graph_failures = {}
 
     def embedding_helper(self, input_ids, position_ids):
         assert input_ids.size() == position_ids.size()
@@ -348,6 +366,146 @@ class PagedDecoderLM(nn.Module):
 
         return logits
 
+    def _forward_decode_tensor_core(
+        self,
+        hidden_states,
+        request_ids,
+        paged_attn_manager,
+        decode_metadata,
+    ):
+        for layer in self.layers:
+            hidden_states = layer.forward_decode_tensors(
+                hidden_states,
+                request_ids,
+                paged_attn_manager,
+                decode_metadata,
+            )
+        return self.output_layer(self.final_layernorm(hidden_states))
+
+    def _cuda_graph_key(self, hidden_states, decode_metadata, paged_attn_manager):
+        batch_size = hidden_states.shape[0]
+        if (
+            not self.enable_cuda_graphs
+            or paged_attn_manager.decode_attention_backend != "triton"
+            or not hidden_states.is_cuda
+            or not torch.is_inference_mode_enabled()
+            or batch_size not in CUDA_GRAPH_BATCH_SIZES
+        ):
+            return None
+        context_bucket = 1 << (
+            decode_metadata.maximum_context_length - 1
+        ).bit_length()
+        return (
+            hidden_states.device,
+            hidden_states.dtype,
+            batch_size,
+            context_bucket,
+            decode_metadata.block_table.stride(0),
+            self.config.hidden_size,
+            paged_attn_manager.kv_manager.cache_dtype,
+        )
+
+    def _capture_decode_cuda_graph(
+        self,
+        key,
+        hidden_states,
+        request_ids,
+        paged_attn_manager,
+        decode_metadata,
+    ):
+        static_hidden_states = torch.empty_like(hidden_states)
+        static_hidden_states.copy_(hidden_states)
+
+        # Compile/autotune Triton and populate allocator caches before capture.
+        warmup_stream = torch.cuda.Stream(device=hidden_states.device)
+        warmup_stream.wait_stream(torch.cuda.current_stream(hidden_states.device))
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                self._forward_decode_tensor_core(
+                    static_hidden_states,
+                    request_ids,
+                    paged_attn_manager,
+                    decode_metadata,
+                )
+        warmup_stream.synchronize()
+        torch.cuda.current_stream(hidden_states.device).wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_logits = self._forward_decode_tensor_core(
+                static_hidden_states,
+                request_ids,
+                paged_attn_manager,
+                decode_metadata,
+            )
+        entry = DecodeCUDAGraph(
+            graph,
+            static_hidden_states,
+            static_logits,
+            decode_metadata,
+        )
+        self._decode_cuda_graphs[key] = entry
+        return entry
+
+    def _forward_decode_with_cuda_graph(
+        self,
+        hidden_states,
+        request_ids,
+        kv_manager,
+        paged_attn_manager,
+        decode_metadata,
+    ):
+        key = self._cuda_graph_key(
+            hidden_states,
+            decode_metadata,
+            paged_attn_manager,
+        )
+        if key is None or key in self._decode_cuda_graph_failures:
+            return None
+        entry = self._decode_cuda_graphs.get(key)
+        if entry is None:
+            try:
+                entry = self._capture_decode_cuda_graph(
+                    key,
+                    hidden_states,
+                    request_ids,
+                    paged_attn_manager,
+                    decode_metadata,
+                )
+            except RuntimeError as error:
+                self._decode_cuda_graph_failures[key] = (
+                    f"{type(error).__name__}: {error}"
+                )
+                return None
+        elif (
+            entry.decode_metadata.block_table.untyped_storage().data_ptr()
+            != decode_metadata.block_table.untyped_storage().data_ptr()
+        ):
+            self._decode_cuda_graph_failures[key] = (
+                "decode metadata storage address changed"
+            )
+            return None
+
+        entry.hidden_states.copy_(hidden_states)
+        entry.graph.replay()
+        entry.replays += 1
+        # Python request bookkeeping is the control plane and is intentionally
+        # outside the captured GPU data path.
+        for layer_id in range(self.config.num_layers):
+            kv_manager.mark_reserved_layer_written(request_ids, layer_id)
+        return entry.logits
+
+    def cuda_graph_summary(self):
+        return {
+            "enabled": self.enable_cuda_graphs,
+            "enabled_batch_sizes": list(CUDA_GRAPH_BATCH_SIZES),
+            "captured_graphs": len(self._decode_cuda_graphs),
+            "graph_replays": sum(
+                entry.replays for entry in self._decode_cuda_graphs.values()
+            ),
+            "capture_failures": list(self._decode_cuda_graph_failures.values()),
+        }
+
     def forward_iteration(self, iteration_batch: IterationBatch, kv_manager: KVCacheManager, paged_attn_manager: PagedAttention):
         if iteration_batch.input_ids.device != next(self.parameters()).device:
             raise ValueError("Iteration inputs and model must be on the same device")
@@ -401,14 +559,20 @@ class PagedDecoderLM(nn.Module):
 
         decode_only = len(decode_request_ids) == len(iteration_batch.items)
         if decode_only:
-            for layer in self.layers:
-                hidden_states = layer.forward_decode_tensors(
+            logits = self._forward_decode_with_cuda_graph(
+                hidden_states,
+                decode_request_ids,
+                kv_manager,
+                paged_attn_manager,
+                decode_metadata,
+            )
+            if logits is None:
+                logits = self._forward_decode_tensor_core(
                     hidden_states,
                     decode_request_ids,
                     paged_attn_manager,
                     decode_metadata,
                 )
-            logits = self.output_layer(self.final_layernorm(hidden_states))
             for request_id in decode_request_ids:
                 kv_manager.commit_token(request_id)
             return logits
@@ -453,4 +617,3 @@ class PagedDecoderLM(nn.Module):
                 kv_manager.commit_token(item.request_id)
 
         return logits
-
