@@ -151,12 +151,16 @@ def _paged_decode_attention_kernel(
             + dimension_offsets * value_stride_dim
         )
         if KV_QUANTIZED:
-            key_scale = tl.max(tl.abs(current_key), axis=0) / 127.0
-            value_scale = tl.max(tl.abs(current_value), axis=0) / 127.0
-            key_scale = tl.where(key_scale > 0.0, key_scale, 1.0)
-            value_scale = tl.where(value_scale > 0.0, value_scale, 1.0)
-            scaled_key = current_key / key_scale
-            scaled_value = current_value / value_scale
+            current_key_scale = tl.max(tl.abs(current_key), axis=0) / 127.0
+            current_value_scale = tl.max(tl.abs(current_value), axis=0) / 127.0
+            current_key_scale = tl.where(
+                current_key_scale > 0.0, current_key_scale, 1.0
+            )
+            current_value_scale = tl.where(
+                current_value_scale > 0.0, current_value_scale, 1.0
+            )
+            scaled_key = current_key / current_key_scale
+            scaled_value = current_value / current_value_scale
             rounded_key = tl.where(
                 scaled_key >= 0.0,
                 tl.floor(scaled_key + 0.5),
@@ -169,8 +173,8 @@ def _paged_decode_attention_kernel(
             )
             quantized_key = tl.maximum(-127.0, tl.minimum(127.0, rounded_key))
             quantized_value = tl.maximum(-127.0, tl.minimum(127.0, rounded_value))
-            current_key_for_attention = quantized_key * key_scale
-            current_value_for_attention = quantized_value * value_scale
+            current_key_for_attention = quantized_key * current_key_scale
+            current_value_for_attention = quantized_value * current_value_scale
             tl.store(
                 key_pool + current_key_pool_offsets,
                 quantized_key,
@@ -193,8 +197,11 @@ def _paged_decode_attention_kernel(
                 + head_index * value_scale_stride_head
                 + reserved_offset * value_scale_stride_token
             )
-            tl.store(key_scales + current_key_scale_offset, key_scale)
-            tl.store(value_scales + current_value_scale_offset, value_scale)
+            tl.store(key_scales + current_key_scale_offset, current_key_scale)
+            tl.store(
+                value_scales + current_value_scale_offset,
+                current_value_scale,
+            )
         else:
             current_key_for_attention = current_key
             current_value_for_attention = current_value
@@ -248,12 +255,12 @@ def _paged_decode_attention_kernel(
                 + head_index * key_scale_stride_head
                 + token_offsets * key_scale_stride_token
             )
-            key_scale = tl.load(
+            cached_key_scales = tl.load(
                 key_scales + key_scale_offsets,
                 mask=token_mask,
                 other=0.0,
             ).to(tl.float32)
-            keys = keys * key_scale[:, None]
+            keys = keys * cached_key_scales[:, None]
         if WRITE_KV:
             current_token_mask = token_positions == context_length - 1
             keys = tl.where(
@@ -289,12 +296,12 @@ def _paged_decode_attention_kernel(
                 + head_index * value_scale_stride_head
                 + token_offsets * value_scale_stride_token
             )
-            value_scale = tl.load(
+            cached_value_scales = tl.load(
                 value_scales + value_scale_offsets,
                 mask=token_mask,
                 other=0.0,
             ).to(tl.float32)
-            values = values * value_scale[:, None]
+            values = values * cached_value_scales[:, None]
         if WRITE_KV:
             values = tl.where(
                 current_token_mask[:, None],
