@@ -91,15 +91,13 @@ class PagedSelfAttention(nn.Module):
         k = self.split_heads(k).squeeze(2)
         v = self.split_heads(v).squeeze(2)
 
-        kv_manger.write_layer_kv_batch(
+        output = paged_attn_manager.forward_batch(
             request_ids,
             layer_id,
-            k,
-            v,
+            q,
             decode_metadata=decode_metadata,
-        )
-        output = paged_attn_manager.forward_batch(
-            request_ids, layer_id, q, decode_metadata=decode_metadata
+            new_keys=k,
+            new_values=v,
         )
         output = output.unsqueeze(2) # [B, heads, 1, head_dim]
         output = self.merge_heads(output)
@@ -122,6 +120,29 @@ class PagedSelfAttention(nn.Module):
         )
         output = self.output_linear(self.merge_heads_flat(context))
         return output, prefill_kv
+
+    def forward_decode_tensors(
+        self,
+        hidden_states,
+        request_ids,
+        layer_id,
+        paged_attn_manager: PagedAttention,
+        decode_metadata,
+    ):
+        """Decode-only path without per-layer IterationItem traversal."""
+        queries, keys, values = self.project_qkv(hidden_states)
+        queries = self.split_heads_flat(queries)
+        keys = self.split_heads_flat(keys)
+        values = self.split_heads_flat(values)
+        context = paged_attn_manager.forward_batch(
+            request_ids,
+            layer_id,
+            queries,
+            decode_metadata=decode_metadata,
+            new_keys=keys,
+            new_values=values,
+        )
+        return self.output_linear(self.merge_heads_flat(context))
 
 
 
@@ -154,16 +175,19 @@ class DecoderBlock(nn.Module):
 
     def decode(self, hidden_states, request_ids, kv_manger: KVCacheManager, paged_attn_manager: PagedAttention, decode_metadata):
         attention_residual = hidden_states
-        hidden_states = self.self_attn.decode(self.input_layernorm(hidden_states),
+        attention_output = self.self_attn.decode(self.input_layernorm(hidden_states),
                                                                   request_ids,
                                                                   self.layer_id,
                                                                   kv_manger,
                                                                   paged_attn_manager,
                                                                   decode_metadata)
-
-        hidden_states = hidden_states + attention_residual
+        hidden_states, normalized_hidden_states = self._residual_and_norm(
+            attention_residual,
+            attention_output,
+            paged_attn_manager,
+        )
         mlp_residual = hidden_states
-        hidden_states = self.mlp_up_proj(self.post_attention_layernorm(hidden_states))
+        hidden_states = self.mlp_up_proj(normalized_hidden_states)
         hidden_states = self._activate(hidden_states)
         hidden_states = self.mlp_down_proj(hidden_states) + mlp_residual
         return hidden_states
@@ -177,13 +201,59 @@ class DecoderBlock(nn.Module):
             paged_attn_manager,
             decode_metadata,
         )
-        hidden_states = attention_output + attention_residual
-
+        hidden_states, normalized_hidden_states = self._residual_and_norm(
+            attention_residual,
+            attention_output,
+            paged_attn_manager,
+        )
         mlp_residual = hidden_states
-        hidden_states = self.mlp_up_proj(self.post_attention_layernorm(hidden_states))
+        hidden_states = self.mlp_up_proj(normalized_hidden_states)
         hidden_states = self._activate(hidden_states)
         hidden_states = self.mlp_down_proj(hidden_states) + mlp_residual
         return hidden_states, prefill_kv
+
+    def forward_decode_tensors(
+        self,
+        hidden_states,
+        request_ids,
+        paged_attn_manager: PagedAttention,
+        decode_metadata,
+    ):
+        attention_residual = hidden_states
+        attention_output = self.self_attn.forward_decode_tensors(
+            self.input_layernorm(hidden_states),
+            request_ids,
+            self.layer_id,
+            paged_attn_manager,
+            decode_metadata,
+        )
+        hidden_states, normalized_hidden_states = self._residual_and_norm(
+            attention_residual,
+            attention_output,
+            paged_attn_manager,
+        )
+        mlp_output = self.mlp_up_proj(normalized_hidden_states)
+        mlp_output = self._activate(mlp_output)
+        return self.mlp_down_proj(mlp_output) + hidden_states
+
+    def _residual_and_norm(self, residual, update, paged_attn_manager):
+        if (
+            paged_attn_manager.decode_attention_backend == "triton"
+            and residual.is_cuda
+        ):
+            from src.kernels.triton_residual_layernorm import (
+                fused_residual_layer_norm,
+            )
+
+            return fused_residual_layer_norm(
+                residual,
+                update,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.bias,
+                self.post_attention_layernorm.eps,
+            )
+        hidden_states = residual + update
+        return hidden_states, self.post_attention_layernorm(hidden_states)
 
     def _activate(self, hidden_states):
         if self.config.activation_function == "gelu":
@@ -329,6 +399,20 @@ class PagedDecoderLM(nn.Module):
             else None
         )
 
+        decode_only = len(decode_request_ids) == len(iteration_batch.items)
+        if decode_only:
+            for layer in self.layers:
+                hidden_states = layer.forward_decode_tensors(
+                    hidden_states,
+                    decode_request_ids,
+                    paged_attn_manager,
+                    decode_metadata,
+                )
+            logits = self.output_layer(self.final_layernorm(hidden_states))
+            for request_id in decode_request_ids:
+                kv_manager.commit_token(request_id)
+            return logits
+
         for layer in self.layers:
             # Entire flattened tensor then passes through every decoder layer
             hidden_states, layer_prefill_kv = layer.forward_iteration(
@@ -369,6 +453,4 @@ class PagedDecoderLM(nn.Module):
                 kv_manager.commit_token(item.request_id)
 
         return logits
-
-
 

@@ -69,9 +69,40 @@ def test_torch_vs_triton_full_correctness_matrix(dtype):
                 (batch_size,), context_length, dtype=torch.int32, device="cuda"
             )
             for layer_id in TEST_LAYERS:
+                new_keys = torch.randn(
+                    queries.shape,
+                    dtype=dtype,
+                    device="cuda",
+                    generator=generator,
+                )
+                new_values = torch.randn(
+                    queries.shape,
+                    dtype=dtype,
+                    device="cuda",
+                    generator=generator,
+                )
+                reserved_blocks = table[:, (context_length - 1) // 16].contiguous()
+                reserved_offsets = torch.full(
+                    (batch_size,),
+                    (context_length - 1) % 16,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                reserved_long = reserved_blocks.to(torch.long)
+                reserved_offset = (context_length - 1) % 16
+                original_keys = key_pool[
+                    layer_id, reserved_long, :, reserved_offset
+                ].clone()
+                original_values = value_pool[
+                    layer_id, reserved_long, :, reserved_offset
+                ].clone()
+                key_pool[layer_id, reserved_long, :, reserved_offset] = new_keys
+                value_pool[layer_id, reserved_long, :, reserved_offset] = new_values
                 expected = _torch_gather_sdpa(
                     queries, key_pool, value_pool, table, layer_id, context_length
                 )
+                key_pool[layer_id, reserved_long, :, reserved_offset] = original_keys
+                value_pool[layer_id, reserved_long, :, reserved_offset] = original_values
                 output_buffer = torch.empty_like(queries)
                 actual = paged_decode_attention_triton(
                     queries,
@@ -82,11 +113,23 @@ def test_torch_vs_triton_full_correctness_matrix(dtype):
                     table,
                     lengths,
                     layer_id,
+                    new_keys=new_keys,
+                    new_values=new_values,
+                    reserved_block_ids=reserved_blocks,
+                    reserved_block_offsets=reserved_offsets,
                     output=output_buffer,
                     maximum_context_length=context_length,
                     validate_inputs=False,
                 )
                 assert actual.data_ptr() == output_buffer.data_ptr()
+                torch.testing.assert_close(
+                    key_pool[layer_id, reserved_long, :, reserved_offset],
+                    new_keys,
+                )
+                torch.testing.assert_close(
+                    value_pool[layer_id, reserved_long, :, reserved_offset],
+                    new_values,
+                )
                 assert torch.isfinite(actual).all(), (
                     dtype, batch_size, context_length, layer_id
                 )
@@ -142,6 +185,77 @@ def test_nonfinite_queries_are_rejected(nonfinite):
             torch.tensor([[0]], dtype=torch.int32, device="cuda"),
             torch.tensor([1], dtype=torch.int32, device="cuda"),
             0,
+        )
+
+
+@CUDA_TRITON
+@pytest.mark.parametrize(
+    "corruption",
+    ("negative_reserved_page", "large_reserved_page", "large_offset", "wrong_page"),
+)
+def test_fused_kv_write_rejects_invalid_reserved_metadata(corruption):
+    pytest.importorskip("triton")
+    from src.kernels.triton_paged_attention import paged_decode_attention_triton
+
+    query = torch.randn(1, 1, 32, device="cuda")
+    new_key = torch.randn_like(query)
+    new_value = torch.randn_like(query)
+    pool = torch.randn(1, 4, 1, 16, 32, device="cuda")
+    scales = torch.empty(1, device="cuda")
+    table = torch.tensor([[2]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([16], dtype=torch.int32, device="cuda")
+    reserved_page = torch.tensor([2], dtype=torch.int32, device="cuda")
+    reserved_offset = torch.tensor([15], dtype=torch.int32, device="cuda")
+    if corruption == "negative_reserved_page":
+        reserved_page[0] = -1
+    elif corruption == "large_reserved_page":
+        reserved_page[0] = pool.shape[1]
+    elif corruption == "large_offset":
+        reserved_offset[0] = 16
+    else:
+        reserved_page[0] = 1
+    with pytest.raises(ValueError, match="reserved|Reserved"):
+        paged_decode_attention_triton(
+            query,
+            pool,
+            pool.clone(),
+            scales,
+            scales,
+            table,
+            lengths,
+            0,
+            new_keys=new_key,
+            new_values=new_value,
+            reserved_block_ids=reserved_page,
+            reserved_block_offsets=reserved_offset,
+        )
+
+
+@CUDA_TRITON
+def test_fused_kv_write_rejects_nonfinite_new_values():
+    pytest.importorskip("triton")
+    from src.kernels.triton_paged_attention import paged_decode_attention_triton
+
+    query = torch.randn(1, 1, 32, device="cuda")
+    new_key = torch.randn_like(query)
+    new_value = torch.randn_like(query)
+    new_value[0, 0, 0] = float("nan")
+    pool = torch.randn(1, 1, 1, 16, 32, device="cuda")
+    scales = torch.empty(1, device="cuda")
+    with pytest.raises(ValueError, match="NaN or Inf"):
+        paged_decode_attention_triton(
+            query,
+            pool,
+            pool.clone(),
+            scales,
+            scales,
+            torch.tensor([[0]], dtype=torch.int32, device="cuda"),
+            torch.tensor([1], dtype=torch.int32, device="cuda"),
+            0,
+            new_keys=new_key,
+            new_values=new_value,
+            reserved_block_ids=torch.tensor([0], dtype=torch.int32, device="cuda"),
+            reserved_block_offsets=torch.tensor([0], dtype=torch.int32, device="cuda"),
         )
 
 
@@ -214,5 +328,107 @@ def test_int8_kv_is_dequantized_inside_triton_kernel():
         maximum_context_length=33,
         validate_inputs=False,
     )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+
+
+@CUDA_TRITON
+@pytest.mark.parametrize("cache_dtype", (torch.float16, torch.int8))
+def test_triton_writes_current_kv_into_fragmented_page_before_attention(cache_dtype):
+    pytest.importorskip("triton")
+    from src.kernels.triton_paged_attention import paged_decode_attention_triton
+
+    generator = torch.Generator(device="cuda").manual_seed(212)
+    float_keys = torch.randn(
+        3, 7, 2, 16, 64,
+        dtype=torch.float16,
+        device="cuda",
+        generator=generator,
+    )
+    float_values = torch.randn(
+        float_keys.shape,
+        dtype=torch.float16,
+        device="cuda",
+        generator=generator,
+    )
+
+    def quantize(values):
+        scales = values.float().abs().amax(dim=-1) / 127
+        scales = torch.where(scales > 0, scales, torch.ones_like(scales))
+        integers = torch.round(values.float() / scales.unsqueeze(-1)).clamp(-127, 127)
+        return integers.to(torch.int8), scales
+
+    if cache_dtype == torch.int8:
+        key_pool, key_scales = quantize(float_keys)
+        value_pool, value_scales = quantize(float_values)
+    else:
+        key_pool = float_keys
+        value_pool = float_values
+        key_scales = torch.empty(1, device="cuda", dtype=torch.float32)
+        value_scales = torch.empty(1, device="cuda", dtype=torch.float32)
+
+    table = torch.tensor([[5, 1, 6], [2, 4, 0]], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([33, 33], device="cuda", dtype=torch.int32)
+    reserved_blocks = table[:, 2].contiguous()
+    reserved_offsets = torch.zeros(2, device="cuda", dtype=torch.int32)
+    queries = torch.randn(
+        2, 2, 64, dtype=torch.float16, device="cuda", generator=generator
+    )
+    new_keys = torch.randn(
+        queries.shape, dtype=torch.float16, device="cuda", generator=generator
+    )
+    new_values = torch.randn(
+        queries.shape, dtype=torch.float16, device="cuda", generator=generator
+    )
+
+    actual = paged_decode_attention_triton(
+        queries,
+        key_pool,
+        value_pool,
+        key_scales,
+        value_scales,
+        table,
+        lengths,
+        2,
+        new_keys=new_keys,
+        new_values=new_values,
+        reserved_block_ids=reserved_blocks,
+        reserved_block_offsets=reserved_offsets,
+        maximum_context_length=33,
+        validate_inputs=False,
+    )
+    torch.cuda.synchronize()
+
+    if cache_dtype == torch.int8:
+        stored_keys = (
+            key_pool[2, reserved_blocks.long(), :, 0].float()
+            * key_scales[2, reserved_blocks.long(), :, 0].unsqueeze(-1)
+        )
+        stored_values = (
+            value_pool[2, reserved_blocks.long(), :, 0].float()
+            * value_scales[2, reserved_blocks.long(), :, 0].unsqueeze(-1)
+        )
+        dequantized_keys = key_pool.float() * key_scales.unsqueeze(-1)
+        dequantized_values = value_pool.float() * value_scales.unsqueeze(-1)
+        expected = _torch_gather_sdpa(
+            queries.float(),
+            dequantized_keys,
+            dequantized_values,
+            table,
+            2,
+            33,
+        ).half()
+        torch.testing.assert_close(stored_keys, new_keys.float(), atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(stored_values, new_values.float(), atol=3e-2, rtol=3e-2)
+    else:
+        torch.testing.assert_close(
+            key_pool[2, reserved_blocks.long(), :, 0], new_keys
+        )
+        torch.testing.assert_close(
+            value_pool[2, reserved_blocks.long(), :, 0], new_values
+        )
+        expected = _torch_gather_sdpa(
+            queries, key_pool, value_pool, table, 2, 33
+        )
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)

@@ -139,6 +139,8 @@ class PagedAttention:
         queries,
         decode_metadata: DecodeMetadata = None,
         output: torch.Tensor = None,
+        new_keys: torch.Tensor = None,
+        new_values: torch.Tensor = None,
     ):
         if not request_ids:
             return None
@@ -153,7 +155,16 @@ class PagedAttention:
             decode_metadata = self.kv_manager.build_decode_metadata(request_ids)
         elif decode_metadata.request_ids != tuple(request_ids):
             raise ValueError("Decode metadata request order does not match")
-        self.kv_manager.validate_decode_layer(request_ids, layer_id)
+        write_kv = new_keys is not None or new_values is not None
+        if write_kv:
+            if new_keys is None or new_values is None:
+                raise ValueError("New keys and values must be provided together")
+            expected_kv_shape = (batch_size, self.num_kv_heads, self.head_dim)
+            if new_keys.shape != expected_kv_shape or new_values.shape != expected_kv_shape:
+                raise ValueError("New K/V tensors must match the decode batch")
+            self.kv_manager.validate_reserved_layer_write(request_ids, layer_id)
+        else:
+            self.kv_manager.validate_decode_layer(request_ids, layer_id)
 
         if self.decode_attention_backend == "triton":
             # Keep Triton optional: importing it is only necessary when this
@@ -162,7 +173,7 @@ class PagedAttention:
                 paged_decode_attention_triton,
             )
 
-            return paged_decode_attention_triton(
+            computed_output = paged_decode_attention_triton(
                 queries,
                 self.kv_manager.key_pool,
                 self.kv_manager.value_pool,
@@ -171,9 +182,29 @@ class PagedAttention:
                 decode_metadata.block_table,
                 decode_metadata.context_lengths,
                 layer_id,
+                new_keys=new_keys,
+                new_values=new_values,
+                reserved_block_ids=(
+                    decode_metadata.reserved_block_ids if write_kv else None
+                ),
+                reserved_block_offsets=(
+                    decode_metadata.reserved_block_offsets if write_kv else None
+                ),
                 output=output,
                 maximum_context_length=decode_metadata.maximum_context_length,
                 validate_inputs=False,
+            )
+            if write_kv:
+                self.kv_manager.mark_reserved_layer_written(request_ids, layer_id)
+            return computed_output
+
+        if write_kv:
+            self.kv_manager.write_layer_kv_batch(
+                request_ids,
+                layer_id,
+                new_keys,
+                new_values,
+                decode_metadata=decode_metadata,
             )
 
         keys, values, valid_positions = self.kv_manager.gather_decode_layer_batch(
@@ -291,19 +322,14 @@ class PagedAttention:
                 decode_output_buffer = self._inference_buffer(
                     "decode_outputs", decode_queries
                 )
-            self.kv_manager.write_layer_kv_batch(
-                decode_request_ids,
-                layer_id,
-                decode_keys,
-                decode_values,
-                decode_metadata=decode_metadata,
-            )
             decode_outputs = self.forward_batch(
                 decode_request_ids,
                 layer_id,
                 decode_queries,
                 decode_metadata=decode_metadata,
                 output=decode_output_buffer,
+                new_keys=decode_keys,
+                new_values=decode_values,
             )
             if not decode_only:
                 outputs.index_copy_(

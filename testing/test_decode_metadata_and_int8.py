@@ -43,7 +43,11 @@ def test_decode_metadata_is_constructed_once_and_reused_across_layers():
             manager,
             "build_decode_metadata",
             wraps=manager.build_decode_metadata,
-        ) as build:
+        ) as build, patch.object(
+            attention,
+            "forward_iteration",
+            wraps=attention.forward_iteration,
+        ) as generic_iteration_attention:
             model.forward_iteration(
                 IterationBatch(
                     items=(
@@ -63,6 +67,7 @@ def test_decode_metadata_is_constructed_once_and_reused_across_layers():
                 attention,
             )
     assert build.call_count == 1
+    assert generic_iteration_attention.call_count == 0
     manager.reserve_token_slot("request")
     metadata = manager.build_decode_metadata(["request"])
     assert metadata.request_ids == ("request",)
@@ -109,6 +114,27 @@ def test_inference_buffers_and_offset_patterns_are_reused():
         )
     assert first_buffer.data_ptr() == second_buffer.data_ptr()
     assert first_offsets.data_ptr() == second_offsets.data_ptr()
+
+
+def test_packed_decode_metadata_storage_is_reused_in_inference_mode():
+    manager = _manager()
+    manager.store_prefill_request(
+        "request",
+        [(torch.randn(2, 4, 8), torch.randn(2, 4, 8)) for _ in range(3)],
+    )
+    manager.reserve_token_slot("request")
+    with torch.inference_mode():
+        first = manager.build_decode_metadata(["request"])
+        second = manager.build_decode_metadata(["request"])
+    assert (
+        first.block_table.untyped_storage().data_ptr()
+        == second.block_table.untyped_storage().data_ptr()
+    )
+    assert second.context_lengths.tolist() == [5]
+    assert second.reserved_block_ids.tolist() == [
+        manager.requests["request"].reserved_block_id
+    ]
+    assert second.reserved_block_offsets.tolist() == [4]
 
 
 def test_int8_cache_increases_capacity_and_tracks_float_attention():

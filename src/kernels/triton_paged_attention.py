@@ -19,23 +19,34 @@ import triton.language as tl
         "BATCH_BUCKET",
         "CONTEXT_BUCKET",
         "KV_QUANTIZED",
+        "WRITE_KV",
     ],
 )
 @triton.jit
 def _paged_decode_attention_kernel(
     queries,
+    new_keys,
+    new_values,
     key_pool,
     value_pool,
     key_scales,
     value_scales,
     block_table,
     context_lengths,
+    reserved_block_ids,
+    reserved_block_offsets,
     output,
     layer_id,
     scale,
     query_stride_batch,
     query_stride_head,
     query_stride_dim,
+    new_key_stride_batch,
+    new_key_stride_head,
+    new_key_stride_dim,
+    new_value_stride_batch,
+    new_value_stride_head,
+    new_value_stride_dim,
     key_stride_layer,
     key_stride_block,
     key_stride_head,
@@ -57,6 +68,8 @@ def _paged_decode_attention_kernel(
     table_stride_batch,
     table_stride_block,
     context_length_stride,
+    reserved_block_id_stride,
+    reserved_block_offset_stride,
     output_stride_batch,
     output_stride_head,
     output_stride_dim,
@@ -64,6 +77,7 @@ def _paged_decode_attention_kernel(
     HEAD_DIM: tl.constexpr,
     PADDED_HEAD_DIM: tl.constexpr,
     KV_QUANTIZED: tl.constexpr,
+    WRITE_KV: tl.constexpr,
     BATCH_BUCKET: tl.constexpr,
     CONTEXT_BUCKET: tl.constexpr,
 ):
@@ -94,6 +108,106 @@ def _paged_decode_attention_kernel(
     # value to an int64 tensor works for both specialized constants and runtime
     # scalar arguments while keeping all subsequent pool offsets in int64.
     layer_index_64 = tl.zeros((1,), dtype=tl.int64) + layer_id
+
+    if WRITE_KV:
+        reserved_block = tl.load(
+            reserved_block_ids + request_index * reserved_block_id_stride
+        ).to(tl.int64)
+        reserved_offset = tl.load(
+            reserved_block_offsets + request_index * reserved_block_offset_stride
+        ).to(tl.int64)
+        new_key_offsets = (
+            request_index * new_key_stride_batch
+            + head_index * new_key_stride_head
+            + dimension_offsets * new_key_stride_dim
+        )
+        new_value_offsets = (
+            request_index * new_value_stride_batch
+            + head_index * new_value_stride_head
+            + dimension_offsets * new_value_stride_dim
+        )
+        current_key = tl.load(
+            new_keys + new_key_offsets,
+            mask=dimension_mask,
+            other=0.0,
+        ).to(tl.float32)
+        current_value = tl.load(
+            new_values + new_value_offsets,
+            mask=dimension_mask,
+            other=0.0,
+        ).to(tl.float32)
+        current_key_pool_offsets = (
+            layer_index_64 * key_stride_layer
+            + reserved_block * key_stride_block
+            + head_index * key_stride_head
+            + reserved_offset * key_stride_token
+            + dimension_offsets * key_stride_dim
+        )
+        current_value_pool_offsets = (
+            layer_index_64 * value_stride_layer
+            + reserved_block * value_stride_block
+            + head_index * value_stride_head
+            + reserved_offset * value_stride_token
+            + dimension_offsets * value_stride_dim
+        )
+        if KV_QUANTIZED:
+            key_scale = tl.max(tl.abs(current_key), axis=0) / 127.0
+            value_scale = tl.max(tl.abs(current_value), axis=0) / 127.0
+            key_scale = tl.where(key_scale > 0.0, key_scale, 1.0)
+            value_scale = tl.where(value_scale > 0.0, value_scale, 1.0)
+            scaled_key = current_key / key_scale
+            scaled_value = current_value / value_scale
+            rounded_key = tl.where(
+                scaled_key >= 0.0,
+                tl.floor(scaled_key + 0.5),
+                tl.ceil(scaled_key - 0.5),
+            )
+            rounded_value = tl.where(
+                scaled_value >= 0.0,
+                tl.floor(scaled_value + 0.5),
+                tl.ceil(scaled_value - 0.5),
+            )
+            quantized_key = tl.maximum(-127.0, tl.minimum(127.0, rounded_key))
+            quantized_value = tl.maximum(-127.0, tl.minimum(127.0, rounded_value))
+            current_key_for_attention = quantized_key * key_scale
+            current_value_for_attention = quantized_value * value_scale
+            tl.store(
+                key_pool + current_key_pool_offsets,
+                quantized_key,
+                mask=dimension_mask,
+            )
+            tl.store(
+                value_pool + current_value_pool_offsets,
+                quantized_value,
+                mask=dimension_mask,
+            )
+            current_key_scale_offset = (
+                layer_index_64 * key_scale_stride_layer
+                + reserved_block * key_scale_stride_block
+                + head_index * key_scale_stride_head
+                + reserved_offset * key_scale_stride_token
+            )
+            current_value_scale_offset = (
+                layer_index_64 * value_scale_stride_layer
+                + reserved_block * value_scale_stride_block
+                + head_index * value_scale_stride_head
+                + reserved_offset * value_scale_stride_token
+            )
+            tl.store(key_scales + current_key_scale_offset, key_scale)
+            tl.store(value_scales + current_value_scale_offset, value_scale)
+        else:
+            current_key_for_attention = current_key
+            current_value_for_attention = current_value
+            tl.store(
+                key_pool + current_key_pool_offsets,
+                current_key,
+                mask=dimension_mask,
+            )
+            tl.store(
+                value_pool + current_value_pool_offsets,
+                current_value,
+                mask=dimension_mask,
+            )
 
     # Online-softmax state. Keeping it in FP32 avoids accumulating decode
     # probabilities and weighted values in the cache's lower precision dtype.
@@ -140,6 +254,13 @@ def _paged_decode_attention_kernel(
                 other=0.0,
             ).to(tl.float32)
             keys = keys * key_scale[:, None]
+        if WRITE_KV:
+            current_token_mask = token_positions == context_length - 1
+            keys = tl.where(
+                current_token_mask[:, None],
+                current_key_for_attention[None, :],
+                keys,
+            )
 
         scores = tl.sum(keys * query[None, :], axis=1) * scale
         scores = tl.where(token_mask, scores, -float("inf"))
@@ -174,6 +295,12 @@ def _paged_decode_attention_kernel(
                 other=0.0,
             ).to(tl.float32)
             values = values * value_scale[:, None]
+        if WRITE_KV:
+            values = tl.where(
+                current_token_mask[:, None],
+                current_value_for_attention[None, :],
+                values,
+            )
 
         accumulator = (
             accumulator * previous_correction
@@ -206,6 +333,10 @@ def paged_decode_attention_triton(
     block_table: torch.Tensor,
     context_lengths: torch.Tensor,
     layer_id: int,
+    new_keys: torch.Tensor = None,
+    new_values: torch.Tensor = None,
+    reserved_block_ids: torch.Tensor = None,
+    reserved_block_offsets: torch.Tensor = None,
     output: torch.Tensor = None,
     maximum_context_length: int = None,
     validate_inputs: bool = True,
@@ -233,6 +364,32 @@ def paged_decode_attention_triton(
         raise ValueError("Context lengths must have shape [batch]")
 
     batch_size, num_heads, head_dim = queries.shape
+    write_kv = new_keys is not None or new_values is not None
+    if write_kv:
+        if new_keys is None or new_values is None:
+            raise ValueError("New keys and values must be provided together")
+        if reserved_block_ids is None or reserved_block_offsets is None:
+            raise ValueError("Fused K/V writes require reserved block metadata")
+        if new_keys.shape != queries.shape or new_values.shape != queries.shape:
+            raise ValueError("New K/V tensors must match the query shape")
+        if new_keys.dtype != queries.dtype or new_values.dtype != queries.dtype:
+            raise ValueError("New K/V tensors must match the query dtype")
+        write_tensors = (
+            new_keys,
+            new_values,
+            reserved_block_ids,
+            reserved_block_offsets,
+        )
+        if any(tensor.device != queries.device for tensor in write_tensors):
+            raise ValueError("Fused K/V write tensors must share the query device")
+        if reserved_block_ids.shape != (batch_size,):
+            raise ValueError("Reserved block IDs must match the decode batch")
+        if reserved_block_offsets.shape != (batch_size,):
+            raise ValueError("Reserved block offsets must match the decode batch")
+        if reserved_block_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Reserved block IDs must be integer tensors")
+        if reserved_block_offsets.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Reserved block offsets must be integer tensors")
     if block_table.shape[0] != batch_size or context_lengths.shape[0] != batch_size:
         raise ValueError("Decode metadata batch size does not match queries")
     if key_pool.shape[2] != num_heads or key_pool.shape[4] != head_dim:
@@ -285,9 +442,37 @@ def paged_decode_attention_triton(
             ).any().item()
         ):
             raise ValueError("Block table contains an invalid physical block ID")
+        if write_kv:
+            reserved_ids_long = reserved_block_ids.to(torch.int64)
+            reserved_offsets_long = reserved_block_offsets.to(torch.int64)
+            if bool(
+                (
+                    (reserved_ids_long < 0)
+                    | (reserved_ids_long >= key_pool.shape[1])
+                ).any().item()
+            ):
+                raise ValueError("A reserved physical block ID is invalid")
+            if bool(
+                (
+                    (reserved_offsets_long < 0)
+                    | (reserved_offsets_long >= kv_block_size)
+                ).any().item()
+            ):
+                raise ValueError("A reserved block offset is invalid")
+            batch_rows = torch.arange(batch_size, device=block_table.device)
+            expected_ids = block_table[
+                batch_rows,
+                (lengths - 1) // kv_block_size,
+            ].to(torch.int64)
+            expected_offsets = (lengths - 1) % kv_block_size
+            if bool((reserved_ids_long != expected_ids).any().item()):
+                raise ValueError("Reserved block IDs do not match the block table")
+            if bool((reserved_offsets_long != expected_offsets).any().item()):
+                raise ValueError("Reserved offsets do not match context lengths")
         max_context = int(lengths.max().item())
         positions = torch.arange(max_context, device=block_table.device)
-        valid_tokens = positions.unsqueeze(0) < lengths.unsqueeze(1)
+        cached_lengths = lengths - (1 if write_kv else 0)
+        valid_tokens = positions.unsqueeze(0) < cached_lengths.unsqueeze(1)
         batch_indices = torch.arange(
             batch_size, device=block_table.device
         ).unsqueeze(1).expand_as(valid_tokens)[valid_tokens]
@@ -306,7 +491,10 @@ def paged_decode_attention_triton(
                 key_pool[layer_id, physical_indices, :, block_offsets, :],
                 value_pool[layer_id, physical_indices, :, block_offsets, :],
             )
-        if not bool(torch.isfinite(queries).all().item()) or any(
+        finite_inputs = [queries]
+        if write_kv:
+            finite_inputs.extend((new_keys, new_values))
+        if any(not bool(torch.isfinite(tensor).all().item()) for tensor in finite_inputs) or any(
             not bool(torch.isfinite(tensor).all().item())
             for tensor in used_finite_tensors
         ):
@@ -335,30 +523,47 @@ def paged_decode_attention_triton(
     grid = (batch_size, num_heads)
     key_scale_strides = key_scales.stride() if kv_quantized else (0, 0, 0, 0)
     value_scale_strides = value_scales.stride() if kv_quantized else (0, 0, 0, 0)
+    kernel_new_keys = new_keys if write_kv else queries
+    kernel_new_values = new_values if write_kv else queries
+    kernel_reserved_block_ids = (
+        reserved_block_ids if write_kv else context_lengths
+    )
+    kernel_reserved_block_offsets = (
+        reserved_block_offsets if write_kv else context_lengths
+    )
 
     _paged_decode_attention_kernel[grid](
         queries,
+        kernel_new_keys,
+        kernel_new_values,
         key_pool,
         value_pool,
         key_scales,
         value_scales,
         block_table,
         context_lengths,
+        kernel_reserved_block_ids,
+        kernel_reserved_block_offsets,
         output,
         layer_id,
         head_dim ** -0.5,
         *queries.stride(),
+        *kernel_new_keys.stride(),
+        *kernel_new_values.stride(),
         *key_pool.stride(),
         *value_pool.stride(),
         *key_scale_strides,
         *value_scale_strides,
         *block_table.stride(),
         *context_lengths.stride(),
+        *kernel_reserved_block_ids.stride(),
+        *kernel_reserved_block_offsets.stride(),
         *output.stride(),
         KV_BLOCK_SIZE=kv_block_size,
         HEAD_DIM=head_dim,
         PADDED_HEAD_DIM=padded_head_dim,
         KV_QUANTIZED=kv_quantized,
+        WRITE_KV=write_kv,
         BATCH_BUCKET=batch_bucket,
         CONTEXT_BUCKET=context_bucket,
     )

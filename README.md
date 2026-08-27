@@ -14,16 +14,29 @@ request and attention head, follows the table inside the kernel, and reads K/V
 directly from non-contiguous physical pages. No context-sized K/V tensor is
 materialized.
 
+For decode, the same Triton program also writes the newly projected K/V vectors
+to the physical page and in-page offset reserved for that token before including
+the token in online-softmax attention. With an INT8 cache, quantization and scale
+storage happen inside the program. Page allocation and reclamation remain
+scheduler control-plane operations; all paged-cache data movement and traversal
+for Triton decode stay on the GPU.
+
 The block table and context-length tensors describe an iteration, not a model
 layer. PagedServe builds them once after reserving decode slots and passes the same
 tensors through layers 0 through `L-1`. The metadata also contains the physical
 page IDs and in-page offsets reserved for the current tokens, so every layer can
-write its K/V vectors without reconstructing those device tensors.
+write its K/V vectors without reconstructing those device tensors. Block IDs,
+context lengths, reserved IDs, and reserved offsets are packed into one reusable
+device allocation and updated with one packed transfer per iteration.
 
 The GPT-2 path uses one packed QKV projection per layer, reuses inference-only
 decode output/index buffers, and autotunes Triton warp/stage configurations for
 batch-size and context-length buckets. Autotuning occurs during warm-up; timed
 measurements must follow warm-up so compilation and tuning are excluded.
+Decode-only iterations bypass per-layer request-object traversal. On the Triton
+path, attention residual addition and the following MLP LayerNorm are fused into
+one FP32-accumulating Triton kernel; mixed prefill/decode iterations retain the
+general scheduler path.
 
 For each page, the Triton kernel updates online-softmax state. Given previous
 state `(m, l, a)` and page scores `s_i` with values `v_i`:

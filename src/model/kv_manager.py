@@ -66,6 +66,7 @@ class KVCacheManager:
         self.free_blocks = list(range(self.total_available_blocks))
         self.peak_allocated_blocks = 0
         self._decode_token_offset_cache = {}
+        self._decode_metadata_buffers = {}
 
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -405,6 +406,22 @@ class KVCacheManager:
         for request_id in request_ids:
             self.requests[request_id].written_layer_ids.add(layer_id)
 
+    def validate_reserved_layer_write(self, request_ids, layer_id):
+        if not 0 <= layer_id < self.num_layers:
+            raise ValueError("Invalid layer_id")
+        for request_id in request_ids:
+            request_info = self.requests[request_id]
+            if request_info.reserved_position is None:
+                raise RuntimeError(f"Request {request_id} has no reserved token slot")
+            if layer_id in request_info.written_layer_ids:
+                raise RuntimeError(f"Request {request_id} already wrote layer {layer_id}")
+
+    def mark_reserved_layer_written(self, request_ids, layer_id):
+        """Record a successful device-side K/V write performed by Triton."""
+        self.validate_reserved_layer_write(request_ids, layer_id)
+        for request_id in request_ids:
+            self.requests[request_id].written_layer_ids.add(layer_id)
+
 
     def free_request(self, request_id):
         if request_id not in self.requests:
@@ -508,27 +525,37 @@ class KVCacheManager:
             ids + [ids[-1]] * (max_blocks - len(ids)) for ids in block_ids
         ]
 
-        block_table = torch.tensor(
-            block_ids,
-            dtype=torch.int32,
-            device=self.key_pool.device,
-        )
-
-        context_lengths = torch.tensor(
-            context_lengths,
-            dtype=torch.int32,
-            device=self.key_pool.device,
-        )
-        reserved_block_ids = torch.tensor(
-            [request_info.reserved_block_id for request_info in request_infos],
-            dtype=torch.long,
-            device=self.key_pool.device,
-        )
-        reserved_block_offsets = torch.tensor(
-            [request_info.reserved_block_offset for request_info in request_infos],
-            dtype=torch.long,
-            device=self.key_pool.device,
-        )
+        packed_rows = [
+            ids
+            + [
+                context_length,
+                request_info.reserved_block_id,
+                request_info.reserved_block_offset,
+            ]
+            for ids, context_length, request_info in zip(
+                block_ids,
+                context_lengths,
+                request_infos,
+            )
+        ]
+        packed_host = torch.tensor(packed_rows, dtype=torch.int32)
+        if torch.is_inference_mode_enabled():
+            packed_key = (self.key_pool.device, tuple(packed_host.shape))
+            packed_metadata = self._decode_metadata_buffers.get(packed_key)
+            if packed_metadata is None:
+                packed_metadata = torch.empty(
+                    packed_host.shape,
+                    dtype=torch.int32,
+                    device=self.key_pool.device,
+                )
+                self._decode_metadata_buffers[packed_key] = packed_metadata
+            packed_metadata.copy_(packed_host, non_blocking=True)
+        else:
+            packed_metadata = packed_host.to(self.key_pool.device)
+        block_table = packed_metadata[:, :max_blocks]
+        context_lengths = packed_metadata[:, max_blocks]
+        reserved_block_ids = packed_metadata[:, max_blocks + 1]
+        reserved_block_offsets = packed_metadata[:, max_blocks + 2]
         offset_cache_key = (self.key_pool.device, token_offsets)
         token_offsets_tensor = self._decode_token_offset_cache.get(offset_cache_key)
         if token_offsets_tensor is None or not torch.is_inference_mode_enabled():
