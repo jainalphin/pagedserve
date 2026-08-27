@@ -350,7 +350,30 @@ def synchronize_cuda():
         torch.cuda.synchronize()
 
 
-def arrival_offsets(request_rate, num_requests, pattern="fixed", seed=1234):
+def arrival_offsets(
+    request_rate,
+    num_requests,
+    pattern="fixed",
+    seed=1234,
+    duration_seconds=None,
+):
+    if duration_seconds is not None:
+        if duration_seconds <= 0:
+            raise ValueError("duration_seconds must be positive")
+        if math.isinf(request_rate):
+            raise ValueError("A burst rate cannot be combined with a duration")
+        if pattern == "fixed":
+            request_count = math.ceil(request_rate * duration_seconds)
+            return [index / request_rate for index in range(request_count)]
+        if pattern != "poisson":
+            raise ValueError(f"Unknown arrival pattern: {pattern}")
+        generator = random.Random(seed)
+        offsets = [0.0]
+        while True:
+            next_offset = offsets[-1] + generator.expovariate(request_rate)
+            if next_offset >= duration_seconds:
+                return offsets
+            offsets.append(next_offset)
     if math.isinf(request_rate):
         return [0.0] * num_requests
     if pattern == "poisson":
@@ -392,7 +415,7 @@ def parse_request_shape(value):
     return parsed
 
 
-def request_shapes(args):
+def request_shapes(args, num_requests=None):
     shapes = args.request_shape or [
         (args.input_length, args.output_length, 1.0)
     ]
@@ -400,7 +423,7 @@ def request_shapes(args):
     selected = generator.choices(
         [(input_length, output_length) for input_length, output_length, _ in shapes],
         weights=[weight for _, _, weight in shapes],
-        k=args.num_requests,
+        k=args.num_requests if num_requests is None else num_requests,
     )
     return (
         [input_length for input_length, _ in selected],
@@ -599,6 +622,7 @@ def run_pagedserve_scenario(
         len(prompts),
         pattern=args.arrival_pattern,
         seed=args.seed,
+        duration_seconds=args.duration_seconds,
     )
     records = [
         RequestRecord(
@@ -619,9 +643,9 @@ def run_pagedserve_scenario(
     monitor.start()
     benchmark_start = time.perf_counter()
 
-    while next_request < len(prompts) or scheduler.waiting or scheduler.active:
+    while next_request < len(offsets) or scheduler.waiting or scheduler.active:
         elapsed = time.perf_counter() - benchmark_start
-        while next_request < len(prompts) and offsets[next_request] <= elapsed:
+        while next_request < len(offsets) and offsets[next_request] <= elapsed:
             scheduler_id = scheduler.add_token_request(
                 prompts[next_request],
                 max_new_tokens=output_lengths[next_request],
@@ -638,7 +662,7 @@ def run_pagedserve_scenario(
                 record = records[scheduler_ids[scheduler_id]]
                 record.token_times.append(token_time)
                 record.token_ids.append(token_id)
-        elif next_request < len(prompts):
+        elif next_request < len(offsets):
             sleep_for = offsets[next_request] - (time.perf_counter() - benchmark_start)
             if sleep_for > 0:
                 time.sleep(min(sleep_for, 0.001))
@@ -681,6 +705,7 @@ def run_hf_scenario(model, prompts, output_lengths, request_rate, args):
         len(prompts),
         pattern=args.arrival_pattern,
         seed=args.seed,
+        duration_seconds=args.duration_seconds,
     )
     records = [
         RequestRecord(
@@ -758,6 +783,7 @@ async def run_vllm_scenario(
         len(prompts),
         pattern=args.arrival_pattern,
         seed=args.seed,
+        duration_seconds=args.duration_seconds,
     )
     records = [
         RequestRecord(
@@ -908,6 +934,11 @@ def parse_args():
     parser.add_argument("--output-length", type=positive_integer, required=True)
     parser.add_argument("--num-requests", type=positive_integer, default=100)
     parser.add_argument(
+        "--duration-seconds",
+        type=float,
+        help="generate arrivals for this duration; overrides --num-requests",
+    )
+    parser.add_argument(
         "--arrival-pattern",
         choices=("fixed", "poisson"),
         default="fixed",
@@ -987,6 +1018,11 @@ def validate_args(args):
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
     if not 0 < args.kv_cache_memory_utilization <= 1:
         raise ValueError("kv_cache_memory_utilization must be in (0, 1]")
+    if args.duration_seconds is not None:
+        if args.duration_seconds <= 0:
+            raise ValueError("duration_seconds must be positive")
+        if any(math.isinf(rate) for rate in args.request_rate):
+            raise ValueError("duration_seconds cannot be combined with burst traffic")
 
 
 def base_report(args, input_lengths, output_lengths):
@@ -1012,7 +1048,12 @@ def base_report(args, input_lengths, output_lengths):
                     )
                 ]
             ),
-            "num_requests": args.num_requests,
+            "num_requests": len(input_lengths),
+            "configured_num_requests": args.num_requests,
+            "request_count_mode": (
+                "duration" if args.duration_seconds is not None else "fixed_count"
+            ),
+            "arrival_duration_seconds": args.duration_seconds,
             "total_prompt_tokens": sum(input_lengths),
             "requested_output_tokens": sum(output_lengths),
             "actual_input_length_tokens": summarize(input_lengths),
@@ -1383,7 +1424,24 @@ def main():
         del meta_model
     except Exception as error:
         parameter_count_error = f"{type(error).__name__}: {error}"
-    input_lengths, output_lengths = request_shapes(args)
+    if args.duration_seconds is None:
+        generated_request_count = args.num_requests
+    else:
+        generated_request_count = max(
+            len(
+                arrival_offsets(
+                    request_rate,
+                    args.num_requests,
+                    pattern=args.arrival_pattern,
+                    seed=args.seed,
+                    duration_seconds=args.duration_seconds,
+                )
+            )
+            for request_rate in args.request_rate
+        )
+    input_lengths, output_lengths = request_shapes(
+        args, num_requests=generated_request_count
+    )
     prompts = deterministic_mixed_prompts(tokenizer, input_lengths, args.seed)
     report = base_report(args, input_lengths, output_lengths)
     prompt_digest = hashlib.sha256(

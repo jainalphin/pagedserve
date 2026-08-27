@@ -63,6 +63,52 @@ def test_decode_metadata_is_constructed_once_and_reused_across_layers():
                 attention,
             )
     assert build.call_count == 1
+    manager.reserve_token_slot("request")
+    metadata = manager.build_decode_metadata(["request"])
+    assert metadata.request_ids == ("request",)
+    assert metadata.token_offsets.tolist() == [0]
+    assert metadata.reserved_block_ids.numel() == 1
+    assert metadata.reserved_block_offsets.numel() == 1
+
+
+def test_reserved_slot_tensors_are_reused_for_every_layer_write():
+    manager = _manager(num_layers=3)
+    manager.store_prefill_request(
+        "request",
+        [(torch.randn(2, 4, 8), torch.randn(2, 4, 8)) for _ in range(3)],
+    )
+    manager.reserve_token_slot("request")
+    metadata = manager.build_decode_metadata(["request"])
+    key = torch.randn(1, 2, 8)
+    value = torch.randn(1, 2, 8)
+
+    with patch("src.model.kv_manager.torch.tensor") as tensor_constructor:
+        for layer_id in range(3):
+            manager.write_layer_kv_batch(
+                ["request"],
+                layer_id,
+                key,
+                value,
+                decode_metadata=metadata,
+            )
+    tensor_constructor.assert_not_called()
+
+
+def test_inference_buffers_and_offset_patterns_are_reused():
+    manager = _manager()
+    attention = PagedAttention(manager)
+    reference = torch.randn(2, 2, 8)
+    with torch.inference_mode():
+        first_buffer = attention._inference_buffer("decode", reference)
+        second_buffer = attention._inference_buffer("decode", reference)
+        first_offsets = attention.inference_index_tensor(
+            "outputs", [0, 3], reference.device
+        )
+        second_offsets = attention.inference_index_tensor(
+            "outputs", [0, 3], reference.device
+        )
+    assert first_buffer.data_ptr() == second_buffer.data_ptr()
+    assert first_offsets.data_ptr() == second_offsets.data_ptr()
 
 
 def test_int8_cache_increases_capacity_and_tracks_float_attention():

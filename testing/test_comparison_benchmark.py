@@ -3,6 +3,7 @@ import math
 import time
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from comparison_benchmark import (
@@ -63,6 +64,27 @@ def test_poisson_arrivals_are_deterministic_and_not_fixed_interval():
     assert first[0] == 0
     assert first == sorted(first)
     assert first != arrival_offsets(10.0, 5, pattern="fixed", seed=7)
+
+
+def test_duration_driven_arrivals_override_request_count():
+    assert arrival_offsets(
+        2.0,
+        999,
+        pattern="fixed",
+        duration_seconds=1.1,
+    ) == [0.0, 0.5, 1.0]
+    poisson = arrival_offsets(
+        10.0,
+        1,
+        pattern="poisson",
+        seed=7,
+        duration_seconds=1.0,
+    )
+    assert len(poisson) > 1
+    assert poisson == sorted(poisson)
+    assert all(0 <= offset < 1.0 for offset in poisson)
+    with pytest.raises(ValueError, match="burst"):
+        arrival_offsets(math.inf, 1, duration_seconds=1.0)
 
 
 def test_weighted_request_shapes_are_repeatable_and_valid():

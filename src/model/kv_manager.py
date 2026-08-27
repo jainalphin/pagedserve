@@ -24,6 +24,10 @@ class DecodeMetadata:
     block_table: torch.Tensor
     context_lengths: torch.Tensor
     maximum_context_length: int
+    reserved_block_ids: torch.Tensor
+    reserved_block_offsets: torch.Tensor
+    token_offsets: torch.Tensor
+    token_offsets_are_identity: bool
 
 class KVCacheManager:
     def __init__(self, block_size, total_memory, tensor_dtype, device,
@@ -61,6 +65,7 @@ class KVCacheManager:
 
         self.free_blocks = list(range(self.total_available_blocks))
         self.peak_allocated_blocks = 0
+        self._decode_token_offset_cache = {}
 
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -344,7 +349,14 @@ class KVCacheManager:
         return physical_blocks, valid_token_size, context_length
 
 
-    def write_layer_kv_batch(self, request_ids, layer_id, new_keys, new_values):
+    def write_layer_kv_batch(
+        self,
+        request_ids,
+        layer_id,
+        new_keys,
+        new_values,
+        decode_metadata=None,
+    ):
         if not request_ids:
             return
         if len(request_ids) != len(set(request_ids)):
@@ -356,19 +368,31 @@ class KVCacheManager:
         if new_keys.shape != expected_shape or new_values.shape != expected_shape:
             raise ValueError("Unexpected batched K/V shape")
 
-        block_ids = []
-        block_offsets = []
+        request_infos = []
         for request_id in request_ids:
             request_info = self.requests[request_id]
             if request_info.reserved_position is None:
                 raise RuntimeError(f"Request {request_id} has no reserved token slot")
             if layer_id in request_info.written_layer_ids:
                 raise RuntimeError(f"Request {request_id} already wrote layer {layer_id}")
-            block_ids.append(request_info.reserved_block_id)
-            block_offsets.append(request_info.reserved_block_offset)
+            request_infos.append(request_info)
 
-        block_ids = torch.tensor(block_ids, dtype=torch.long, device=self.key_pool.device)
-        block_offsets = torch.tensor(block_offsets, dtype=torch.long, device=self.key_pool.device)
+        if decode_metadata is not None:
+            if decode_metadata.request_ids != tuple(request_ids):
+                raise ValueError("Decode metadata request order does not match")
+            block_ids = decode_metadata.reserved_block_ids
+            block_offsets = decode_metadata.reserved_block_offsets
+        else:
+            block_ids = torch.tensor(
+                [request_info.reserved_block_id for request_info in request_infos],
+                dtype=torch.long,
+                device=self.key_pool.device,
+            )
+            block_offsets = torch.tensor(
+                [request_info.reserved_block_offset for request_info in request_infos],
+                dtype=torch.long,
+                device=self.key_pool.device,
+            )
 
         if self.is_quantized:
             new_keys, key_scales = self._quantize_vectors(new_keys)
@@ -444,7 +468,7 @@ class KVCacheManager:
                     f"Request {request_id} has not written layer {layer_id}"
                 )
 
-    def build_decode_metadata(self, request_ids, layer_id=None):
+    def build_decode_metadata(self, request_ids, layer_id=None, token_offsets=None):
         if not request_ids:
             raise ValueError("request_ids cannot be empty")
         if len(request_ids) != len(set(request_ids)):
@@ -469,6 +493,15 @@ class KVCacheManager:
             request_info.sequence_length + 1 for request_info in request_infos
         ]
         maximum_context_length = max(context_lengths)
+        if token_offsets is None:
+            token_offsets = tuple(range(len(request_ids)))
+        else:
+            token_offsets = tuple(token_offsets)
+        if len(token_offsets) != len(request_ids):
+            raise ValueError("Decode token offsets must match request_ids")
+        if any(offset < 0 for offset in token_offsets):
+            raise ValueError("Decode token offsets cannot be negative")
+        token_offsets_are_identity = token_offsets == tuple(range(len(request_ids)))
         max_blocks = max(len(ids) for ids in block_ids)
 
         block_ids = [
@@ -486,12 +519,40 @@ class KVCacheManager:
             dtype=torch.int32,
             device=self.key_pool.device,
         )
+        reserved_block_ids = torch.tensor(
+            [request_info.reserved_block_id for request_info in request_infos],
+            dtype=torch.long,
+            device=self.key_pool.device,
+        )
+        reserved_block_offsets = torch.tensor(
+            [request_info.reserved_block_offset for request_info in request_infos],
+            dtype=torch.long,
+            device=self.key_pool.device,
+        )
+        offset_cache_key = (self.key_pool.device, token_offsets)
+        token_offsets_tensor = self._decode_token_offset_cache.get(offset_cache_key)
+        if token_offsets_tensor is None or not torch.is_inference_mode_enabled():
+            token_offsets_tensor = torch.tensor(
+                token_offsets,
+                dtype=torch.long,
+                device=self.key_pool.device,
+            )
+            if torch.is_inference_mode_enabled():
+                if len(self._decode_token_offset_cache) >= 128:
+                    self._decode_token_offset_cache.pop(
+                        next(iter(self._decode_token_offset_cache))
+                    )
+                self._decode_token_offset_cache[offset_cache_key] = token_offsets_tensor
 
         return DecodeMetadata(
             request_ids=tuple(request_ids),
             block_table=block_table,
             context_lengths=context_lengths,
             maximum_context_length=maximum_context_length,
+            reserved_block_ids=reserved_block_ids,
+            reserved_block_offsets=reserved_block_offsets,
+            token_offsets=token_offsets_tensor,
+            token_offsets_are_identity=token_offsets_are_identity,
         )
 
     def gather_decode_layer_batch(self, request_ids, layer_id, metadata=None):

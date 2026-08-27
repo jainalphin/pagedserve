@@ -5,6 +5,22 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1, num_stages=2),
+        triton.Config({}, num_warps=2, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=[
+        "KV_BLOCK_SIZE",
+        "HEAD_DIM",
+        "BATCH_BUCKET",
+        "CONTEXT_BUCKET",
+        "KV_QUANTIZED",
+    ],
+)
 @triton.jit
 def _paged_decode_attention_kernel(
     queries,
@@ -48,6 +64,8 @@ def _paged_decode_attention_kernel(
     HEAD_DIM: tl.constexpr,
     PADDED_HEAD_DIM: tl.constexpr,
     KV_QUANTIZED: tl.constexpr,
+    BATCH_BUCKET: tl.constexpr,
+    CONTEXT_BUCKET: tl.constexpr,
 ):
     """Compute one decode-attention output for each request and head."""
     request_index = tl.program_id(0)
@@ -188,6 +206,8 @@ def paged_decode_attention_triton(
     block_table: torch.Tensor,
     context_lengths: torch.Tensor,
     layer_id: int,
+    output: torch.Tensor = None,
+    maximum_context_length: int = None,
     validate_inputs: bool = True,
 ) -> torch.Tensor:
     """Run fused paged attention for a batch of single-token decode queries."""
@@ -293,11 +313,25 @@ def paged_decode_attention_triton(
             raise ValueError("Paged-attention inputs contain NaN or Inf")
 
     padded_head_dim = triton.next_power_of_2(head_dim)
-    output = torch.empty(
-        (batch_size, num_heads, head_dim),
-        dtype=queries.dtype,
-        device=queries.device,
-    )
+    expected_output_shape = (batch_size, num_heads, head_dim)
+    if output is None:
+        output = torch.empty(
+            expected_output_shape,
+            dtype=queries.dtype,
+            device=queries.device,
+        )
+    elif (
+        output.shape != expected_output_shape
+        or output.dtype != queries.dtype
+        or output.device != queries.device
+    ):
+        raise ValueError("Output buffer must match query shape, dtype, and device")
+    if maximum_context_length is None:
+        maximum_context_length = int(context_lengths.max().item())
+    if maximum_context_length <= 0:
+        raise ValueError("maximum_context_length must be positive")
+    batch_bucket = triton.next_power_of_2(batch_size)
+    context_bucket = triton.next_power_of_2(maximum_context_length)
     grid = (batch_size, num_heads)
     key_scale_strides = key_scales.stride() if kv_quantized else (0, 0, 0, 0)
     value_scale_strides = value_scales.stride() if kv_quantized else (0, 0, 0, 0)
@@ -325,6 +359,7 @@ def paged_decode_attention_triton(
         HEAD_DIM=head_dim,
         PADDED_HEAD_DIM=padded_head_dim,
         KV_QUANTIZED=kv_quantized,
-        num_warps=4,
+        BATCH_BUCKET=batch_bucket,
+        CONTEXT_BUCKET=context_bucket,
     )
     return output

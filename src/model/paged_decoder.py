@@ -30,10 +30,13 @@ class PagedSelfAttention(nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
-        self.query_linear = nn.Linear(config.hidden_size, config.hidden_size)
-        self.key_linear = nn.Linear(config.hidden_size, config.hidden_size)
-        self.value_linear = nn.Linear(config.hidden_size, config.hidden_size)
+        # GPT-2 stores Q/K/V as one Conv1D projection. Keeping the same packed
+        # layout performs one GEMM and one weight read instead of three.
+        self.qkv_linear = nn.Linear(config.hidden_size, 3 * config.hidden_size)
         self.output_linear = nn.Linear(config.hidden_size, config.hidden_size)
+
+    def project_qkv(self, hidden_states):
+        return self.qkv_linear(hidden_states).split(self.config.hidden_size, dim=-1)
 
     def split_heads(self, input_data):
         batch_size, sequence_length, hidden_size = input_data.shape
@@ -57,9 +60,7 @@ class PagedSelfAttention(nn.Module):
 
     def prefill(self, hidden_states):
         # hidden_state:  [batch, sequence_length, hidden_size]
-        q = self.query_linear(hidden_states)  # [batch, sequence_length, hidden_size]
-        k = self.key_linear(hidden_states)
-        v = self.value_linear(hidden_states)
+        q, k, v = self.project_qkv(hidden_states)
 
         q = self.split_heads(q) # [B, heads, T, head_dim]
         k = self.split_heads(k)
@@ -84,15 +85,19 @@ class PagedSelfAttention(nn.Module):
         batch_size = len(request_ids)
         assert hidden_states.shape == (batch_size, 1, self.config.hidden_size)
 
-        q = self.query_linear(hidden_states)  # [batch, sequence_length, hidden_size]
-        k = self.key_linear(hidden_states)
-        v = self.value_linear(hidden_states)
+        q, k, v = self.project_qkv(hidden_states)
 
         q = self.split_heads(q).squeeze(2) # [B, heads, 1, head_dim]
         k = self.split_heads(k).squeeze(2)
         v = self.split_heads(v).squeeze(2)
 
-        kv_manger.write_layer_kv_batch(request_ids, layer_id, k, v)
+        kv_manger.write_layer_kv_batch(
+            request_ids,
+            layer_id,
+            k,
+            v,
+            decode_metadata=decode_metadata,
+        )
         output = paged_attn_manager.forward_batch(
             request_ids, layer_id, q, decode_metadata=decode_metadata
         )
@@ -102,9 +107,10 @@ class PagedSelfAttention(nn.Module):
         return output
 
     def forward_iteration(self, hidden_states, items, layer_id, paged_attn_manager: PagedAttention, decode_metadata=None):
-        queries = self.split_heads_flat(self.query_linear(hidden_states))
-        keys = self.split_heads_flat(self.key_linear(hidden_states))
-        values = self.split_heads_flat(self.value_linear(hidden_states))
+        queries, keys, values = self.project_qkv(hidden_states)
+        queries = self.split_heads_flat(queries)
+        keys = self.split_heads_flat(keys)
+        values = self.split_heads_flat(values)
 
         context, prefill_kv = paged_attn_manager.forward_iteration(
             items=items,
@@ -311,8 +317,14 @@ class PagedDecoderLM(nn.Module):
         decode_request_ids = [
             item.request_id for item in iteration_batch.items if item.phase == "decode"
         ]
+        decode_token_offsets = [
+            item.start_offset for item in iteration_batch.items if item.phase == "decode"
+        ]
         decode_metadata = (
-            kv_manager.build_decode_metadata(decode_request_ids)
+            kv_manager.build_decode_metadata(
+                decode_request_ids,
+                token_offsets=decode_token_offsets,
+            )
             if decode_request_ids
             else None
         )
@@ -332,10 +344,16 @@ class PagedDecoderLM(nn.Module):
             item for item in iteration_batch.items if item.produces_output
         ]
         if output_items:
-            output_hidden_states = torch.stack(
-                [hidden_states[item.end_offset - 1] for item in output_items],
-                dim=0,
-            )
+            output_offsets = [item.end_offset - 1 for item in output_items]
+            if output_offsets == list(range(hidden_states.shape[0])):
+                output_hidden_states = hidden_states
+            else:
+                output_offsets = paged_attn_manager.inference_index_tensor(
+                    "model_output_offsets",
+                    output_offsets,
+                    hidden_states.device,
+                )
+                output_hidden_states = hidden_states.index_select(0, output_offsets)
             logits = self.output_layer(self.final_layernorm(output_hidden_states))
         else:
             logits = hidden_states.new_empty((0, self.config.vocab_size))
@@ -351,10 +369,6 @@ class PagedDecoderLM(nn.Module):
                 kv_manager.commit_token(item.request_id)
 
         return logits
-
-
-
-
 
 
 

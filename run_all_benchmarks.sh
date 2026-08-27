@@ -15,6 +15,7 @@ RUN_LONG=true
 RUN_PRODUCTION=false
 REPETITIONS=1
 REQUESTS_PER_REPLICA=120
+DURATION_SECONDS=""
 MAX_BATCH_SIZE=128
 DECODE_ATTENTION_BACKEND="torch"
 TTFT_SLO_MS=""
@@ -39,6 +40,8 @@ Options:
   --engine ENGINE               hf, pagedserve-orca, pagedserve-sarathi, vllm.
                                 Repeat to select multiple engines.
   --requests-per-replica N      Requests per GPU and offered rate (default: 120).
+  --duration-seconds SECONDS    Generate arrivals for this duration per rate;
+                                overrides the request count in timed sweeps.
   --max-batch-size N            Maximum sequences per worker (default: 128).
   --decode-attention-backend B  PagedServe decode backend: torch or triton.
   --short-rate RPS              Repeat to replace short-context rates.
@@ -98,6 +101,11 @@ while [[ $# -gt 0 ]]; do
     --requests-per-replica)
       require_value "$@"
       REQUESTS_PER_REPLICA="$2"
+      shift 2
+      ;;
+    --duration-seconds)
+      require_value "$@"
+      DURATION_SECONDS="$2"
       shift 2
       ;;
     --max-batch-size)
@@ -214,6 +222,11 @@ if [[ ! "$REQUESTS_PER_REPLICA" =~ ^[1-9][0-9]*$ ]]; then
   echo "--requests-per-replica must be a positive integer" >&2
   exit 2
 fi
+if [[ -n "$DURATION_SECONDS" ]] && ! awk -v value="$DURATION_SECONDS" \
+    'BEGIN { exit !(value + 0 > 0) }'; then
+  echo "--duration-seconds must be positive" >&2
+  exit 2
+fi
 if [[ ! "$MAX_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
   echo "--max-batch-size must be a positive integer" >&2
   exit 2
@@ -239,6 +252,7 @@ mkdir -p "$RESULT_ROOT"
   echo "git_branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo detached)"
   echo "python=$($PYTHON_BIN --version 2>&1)"
   echo "requests_per_replica=$REQUESTS_PER_REPLICA"
+  echo "duration_seconds=${DURATION_SECONDS:-request-count-driven}"
   echo "max_batch_size=$MAX_BATCH_SIZE"
   echo "decode_attention_backend=$DECODE_ATTENTION_BACKEND"
   echo "models=${MODELS[*]}"
@@ -301,6 +315,10 @@ run_case() {
     --seed "$((1234 + (trial - 1) * 10000))"
     --output-dir "$case_dir/raw"
   )
+
+  if [[ -n "$DURATION_SECONDS" ]]; then
+    command+=(--duration-seconds "$DURATION_SECONDS")
+  fi
 
   if [[ "$workload_label" == "production-mix" ]]; then
     command+=(

@@ -55,19 +55,10 @@ def convert_gpt2_model(huggingface_model: Any) -> PagedDecoderLM:
                 source_layer.ln_2.state_dict()
             )
 
-            hidden_size = config.hidden_size
-            qkv_weight = source_layer.attn.c_attn.weight
-            qkv_bias = source_layer.attn.c_attn.bias
-            projections = (
-                target_layer.self_attn.query_linear,
-                target_layer.self_attn.key_linear,
-                target_layer.self_attn.value_linear,
+            _copy_linear_from_conv1d(
+                target_layer.self_attn.qkv_linear,
+                source_layer.attn.c_attn,
             )
-            for index, projection in enumerate(projections):
-                start = index * hidden_size
-                end = start + hidden_size
-                projection.weight.copy_(qkv_weight[:, start:end].transpose(0, 1))
-                projection.bias.copy_(qkv_bias[start:end])
 
             _copy_linear_from_conv1d(
                 target_layer.self_attn.output_linear,

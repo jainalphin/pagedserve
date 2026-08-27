@@ -24,6 +24,40 @@ class PagedAttention:
         self.num_kv_heads = kv_manager.num_kv_heads
         self.head_dim = kv_manager.head_dim
         self.scale = self.head_dim ** -0.5
+        self._inference_buffers = {}
+        self._inference_indices = {}
+
+    def _inference_buffer(self, name, reference, shape=None):
+        """Reuse hot-path storage only under the engine's inference-mode guard."""
+        shape = tuple(reference.shape if shape is None else shape)
+        if not torch.is_inference_mode_enabled():
+            return torch.empty(shape, dtype=reference.dtype, device=reference.device)
+        key = (name, reference.device, reference.dtype, shape)
+        buffer = self._inference_buffers.get(key)
+        if buffer is None:
+            buffer = torch.empty(shape, dtype=reference.dtype, device=reference.device)
+            self._inference_buffers[key] = buffer
+        return buffer
+
+    def inference_index_tensor(self, name, offsets, device):
+        """Reuse immutable scheduler offset patterns during inference."""
+        offsets = tuple(offsets)
+        if not torch.is_inference_mode_enabled():
+            return torch.tensor(offsets, dtype=torch.long, device=device)
+        key = (name, device, offsets)
+        indices = self._inference_indices.get(key)
+        if indices is None:
+            if len(self._inference_indices) >= 128:
+                self._inference_indices.pop(next(iter(self._inference_indices)))
+            indices = torch.tensor(offsets, dtype=torch.long, device=device)
+            self._inference_indices[key] = indices
+        return indices
+
+    def _index_decode_tokens(self, name, tensor, metadata):
+        shape = (metadata.token_offsets.numel(), *tensor.shape[1:])
+        output = self._inference_buffer(name, tensor, shape)
+        torch.index_select(tensor, 0, metadata.token_offsets, out=output)
+        return output
 
     def attention_score(self, request_id, layer_id, query):
         assert query.shape == (self.num_kv_heads, self.head_dim)
@@ -104,6 +138,7 @@ class PagedAttention:
         layer_id,
         queries,
         decode_metadata: DecodeMetadata = None,
+        output: torch.Tensor = None,
     ):
         if not request_ids:
             return None
@@ -136,6 +171,8 @@ class PagedAttention:
                 decode_metadata.block_table,
                 decode_metadata.context_lengths,
                 layer_id,
+                output=output,
+                maximum_context_length=decode_metadata.maximum_context_length,
                 validate_inputs=False,
             )
 
@@ -145,14 +182,18 @@ class PagedAttention:
             decode_metadata,
         )
         attention_mask = valid_positions[:, None, None, :]
-        output = F.scaled_dot_product_attention(
+        computed_output = F.scaled_dot_product_attention(
             queries.unsqueeze(2),
             keys,
             values,
             attn_mask=attention_mask,
             dropout_p=0.0,
         )
-        return output.squeeze(2)
+        computed_output = computed_output.squeeze(2)
+        if output is not None:
+            output.copy_(computed_output)
+            return output
+        return computed_output
 
     def causal_prefill_batch(self, queries, keys, values):
         """Run equal-length fresh prompts through one batched SDPA call."""
@@ -220,36 +261,54 @@ class PagedAttention:
         if keys.shape != expected_shape or values.shape != expected_shape:
             raise ValueError("Flattened Q/K/V tensors must have matching shapes")
 
-        outputs = torch.empty_like(queries)
+        outputs = self._inference_buffer("iteration_outputs", queries)
         prefill_kv = {}
 
         decode_items = [item for item in items if item.phase == "decode"]
         if decode_items:
             decode_request_ids = [item.request_id for item in decode_items]
-            decode_keys = torch.stack([keys[item.start_offset] for item in decode_items])
-            decode_values = torch.stack([values[item.start_offset] for item in decode_items])
+            if decode_metadata is None:
+                raise RuntimeError("Decode items require iteration metadata")
+            decode_only = (
+                decode_metadata.token_offsets_are_identity
+                and decode_metadata.token_offsets.numel() == queries.shape[0]
+            )
+            if decode_only:
+                decode_queries = queries
+                decode_keys = keys
+                decode_values = values
+                decode_output_buffer = outputs
+            else:
+                decode_queries = self._index_decode_tokens(
+                    "decode_queries", queries, decode_metadata
+                )
+                decode_keys = self._index_decode_tokens(
+                    "decode_keys", keys, decode_metadata
+                )
+                decode_values = self._index_decode_tokens(
+                    "decode_values", values, decode_metadata
+                )
+                decode_output_buffer = self._inference_buffer(
+                    "decode_outputs", decode_queries
+                )
             self.kv_manager.write_layer_kv_batch(
                 decode_request_ids,
                 layer_id,
                 decode_keys,
                 decode_values,
+                decode_metadata=decode_metadata,
             )
-
-        if decode_items:
-            decode_offsets = [item.start_offset for item in decode_items]
-            decode_queries = torch.stack([queries[offset] for offset in decode_offsets])
             decode_outputs = self.forward_batch(
                 decode_request_ids,
                 layer_id,
                 decode_queries,
                 decode_metadata=decode_metadata,
+                output=decode_output_buffer,
             )
-            decode_offsets = torch.tensor(
-                decode_offsets,
-                dtype=torch.long,
-                device=outputs.device,
-            )
-            outputs[decode_offsets] = decode_outputs
+            if not decode_only:
+                outputs.index_copy_(
+                    0, decode_metadata.token_offsets, decode_outputs
+                )
 
         fresh_prefill_groups = {}
         for item in items:
@@ -271,14 +330,14 @@ class PagedAttention:
                 group_keys,
                 group_values,
             )
-            group_offsets = torch.tensor(
-                [
+            group_offsets = self.inference_index_tensor(
+                "fresh_prefill_group_offsets",
+                (
                     offset
                     for item in group
                     for offset in range(item.start_offset, item.end_offset)
-                ],
-                dtype=torch.long,
-                device=outputs.device,
+                ),
+                outputs.device,
             )
             outputs[group_offsets] = group_outputs.reshape(
                 len(group) * token_count,

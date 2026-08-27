@@ -29,6 +29,9 @@ def test_converted_gpt2_matches_huggingface_prefill_and_decode(num_layers):
     )
     source_model = transformers.GPT2LMHeadModel(source_config).eval()
     model = convert_gpt2_model(source_model)
+    for layer in model.layers:
+        assert layer.self_attn.qkv_linear.in_features == source_config.n_embd
+        assert layer.self_attn.qkv_linear.out_features == 3 * source_config.n_embd
 
     prompt = torch.tensor([[4, 8, 15, 16]], dtype=torch.long)
     with torch.inference_mode():

@@ -98,6 +98,7 @@ def benchmark(args):
                     table,
                     lengths,
                     0,
+                    maximum_context_length=context_length,
                     validate_inputs=False,
                 )
 

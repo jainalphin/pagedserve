@@ -72,6 +72,7 @@ def test_torch_vs_triton_full_correctness_matrix(dtype):
                 expected = _torch_gather_sdpa(
                     queries, key_pool, value_pool, table, layer_id, context_length
                 )
+                output_buffer = torch.empty_like(queries)
                 actual = paged_decode_attention_triton(
                     queries,
                     key_pool,
@@ -81,8 +82,11 @@ def test_torch_vs_triton_full_correctness_matrix(dtype):
                     table,
                     lengths,
                     layer_id,
+                    output=output_buffer,
+                    maximum_context_length=context_length,
                     validate_inputs=False,
                 )
+                assert actual.data_ptr() == output_buffer.data_ptr()
                 assert torch.isfinite(actual).all(), (
                     dtype, batch_size, context_length, layer_id
                 )
@@ -207,6 +211,7 @@ def test_int8_kv_is_dequantized_inside_triton_kernel():
         table,
         lengths,
         2,
+        maximum_context_length=33,
         validate_inputs=False,
     )
     assert torch.isfinite(actual).all()

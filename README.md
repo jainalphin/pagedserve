@@ -16,7 +16,14 @@ materialized.
 
 The block table and context-length tensors describe an iteration, not a model
 layer. PagedServe builds them once after reserving decode slots and passes the same
-tensors through layers 0 through `L-1`.
+tensors through layers 0 through `L-1`. The metadata also contains the physical
+page IDs and in-page offsets reserved for the current tokens, so every layer can
+write its K/V vectors without reconstructing those device tensors.
+
+The GPT-2 path uses one packed QKV projection per layer, reuses inference-only
+decode output/index buffers, and autotunes Triton warp/stage configurations for
+batch-size and context-length buckets. Autotuning occurs during warm-up; timed
+measurements must follow warm-up so compilation and tuning are excluded.
 
 For each page, the Triton kernel updates online-softmax state. Given previous
 state `(m, l, a)` and page scores `s_i` with values `v_i`:
@@ -202,13 +209,31 @@ PYTHONPATH=. python benchmark_decode_backends.py \
 
 | Backend | Batch | Input | Output tok/s (median) | TPOT ms (median) | TTFT ms (median) | Peak GPU MiB (median) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Torch | 1/8/32 | 128/512 | Not measured here | Not measured here | Not measured here | Not measured here |
-| Triton | 1/8/32 | 128/512 | Not measured here | Not measured here | Not measured here | Not measured here |
+| Torch | 1 | 128 | 76.51 | 13.192 | 9.292 | 11742.8 |
+| Triton | 1 | 128 | 100.54 | 9.976 | 9.014 | 11742.8 |
+| Torch | 1 | 512 | 71.11 | 14.004 | 16.026 | 11770.3 |
+| Triton | 1 | 512 | 86.99 | 11.345 | 16.158 | 11770.3 |
+| Torch | 8 | 128 | 557.84 | 13.980 | 25.523 | 11787.0 |
+| Triton | 8 | 128 | 678.86 | 11.327 | 25.759 | 11787.0 |
+| Torch | 8 | 512 | 403.33 | 17.861 | 83.627 | 11943.5 |
+| Triton | 8 | 512 | 546.79 | 12.392 | 84.032 | 11943.5 |
+| Torch | 32 | 128 | 1363.55 | 21.658 | 81.141 | 11943.5 |
+| Triton | 32 | 128 | 1882.43 | 14.895 | 83.345 | 11943.5 |
+| Torch | 32 | 512 | 651.57 | 41.378 | 289.802 | 12573.7 |
+| Triton | 32 | 512 | 1284.72 | 16.308 | 291.271 | 12573.7 |
 
-This checkout was developed in a CPU-only environment, so CUDA numbers and a
-trace are deliberately not fabricated. The commands write all raw runs and the
-median table; publish the generated JSON alongside filled results, including
-cells where Triton loses.
+These Tesla T4 results passed all 50 CUDA tests. Triton improved end-to-end
+throughput in every measured configuration by 1.22×–1.97× and reduced TPOT by
+19.0%–60.6%. See [TRITON_BENCHMARKS.md](TRITON_BENCHMARKS.md) for the full
+FP16/FP32 kernel matrices, temporary-memory results, profiler evidence, INT8
+results, environment, limitations, and evidence checksums.
+
+In a separate three-trial, ten-minute production-style comparison at 60 offered
+RPS across two T4 replicas, Torch saturated at 20.13 requests/s while Triton and
+vLLM sustained 59.93 and 60.02 requests/s. Triton reached 99.85% of vLLM's output
+throughput at that load, although Triton's p95 TPOT remained 4.04× vLLM's. This is a
+demand-limited comparison rather than a maximum-capacity claim; the complete
+tail-latency table and interpretation are in the results report.
 
 ### Profiling evidence
 
@@ -226,6 +251,30 @@ Open it in Perfetto or `chrome://tracing`.
 kernels, `triton_direct_noncontiguous_paged_reads` contains the fused kernel, and
 `metadata_construction_once_per_iteration` exposes metadata CPU/device-copy cost.
 The trace also provides launch duration and the dominant kernel bottlenecks.
+
+Profile the complete GPT-2 decode path when investigating the remaining gap to a
+production engine. This trace includes scheduler work, metadata construction,
+packed QKV and output projections, MLP projections, attention calls, allocator
+events, and CUDA kernel launches:
+
+```bash
+PYTHONPATH=. python profile_full_decode.py \
+  --backend triton --dtype float16 \
+  --batch-size 8 --context-length 512 \
+  --warmup-decodes 5 --iterations 20 \
+  --trace artifacts/full-gpt2-triton-trace.json
+```
+
+Run it once with `--backend torch` and once with `--backend triton`. Compare
+self-CPU time under `scheduler_plus_full_gpt2_decode_iteration`, CUDA time for
+`packed_qkv_projection`/MLP scopes, attention kernel duration, launch gaps, and
+memory events. This identifies where time is spent; it is not a throughput
+benchmark.
+
+On the measured T4 workload, Torch's gather path allocated 120 MiB cumulatively
+across 20 K/V index operations. The fused Triton kernel averaged 246.24 µs and
+did not materialize context-sized K/V tensors. Metadata appeared once in the
+trace, outside the layer calls.
 
 ### INT8 KV-cache extension
 
@@ -250,6 +299,11 @@ The evaluation records usable token capacity under the same byte budget, FP16
 versus INT8 Triton decode latency, mean/maximum logit error, and deterministic
 proxy-perplexity delta. The included text is an engineering proxy, not a named
 corpus benchmark.
+
+On the T4 evaluation, INT8 increased capacity from 7,280 to 13,696 tokens
+(1.88×), but decode latency regressed from 66.32 to 68.68 µs (+3.6%). Proxy
+perplexity changed from 2.08985 to 2.09425 (+0.00440); mean/max absolute logit
+error was 1.0566/32.75.
 
 Benchmark every supported model:
 
@@ -483,20 +537,27 @@ point, and three cold engine repetitions:
 
 ```bash
 bash run_all_benchmarks.sh \
+  --model openai-community/gpt2 \
   --production-only \
-  --production-rate 30 \
-  --production-rate 50 \
   --production-rate 60 \
   --production-rate 80 \
   --production-rate 100 \
   --production-rate 120 \
-  --requests-per-replica 500 \
+  --duration-seconds 600 \
   --repetitions 3 \
   --ttft-slo-ms YOUR_TTFT_LIMIT \
   --tpot-slo-ms YOUR_TPOT_LIMIT \
   --e2e-slo-ms YOUR_E2E_LIMIT \
   --push
 ```
+
+Run that command separately for PagedServe Torch, PagedServe Triton, and vLLM by
+adding, respectively, `--engine pagedserve-orca
+--decode-attention-backend torch`, `--engine pagedserve-orca
+--decode-attention-backend triton`, or `--engine vllm`. A duration applies to
+each rate and repetition; overloaded engines are allowed to drain after arrivals
+stop, so their wall-clock run can exceed ten minutes. Publish medians across the
+three trials and retain p95/p99 request latencies from every trial.
 
 The built-in production-like mix is 50% 128-input/32-output, 30% 384/64,
 15% 768/96, and 5% 900/64. These are explicit starting assumptions, not claims

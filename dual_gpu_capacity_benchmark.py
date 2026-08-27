@@ -27,6 +27,13 @@ def positive_rate(value):
     return parsed
 
 
+def positive_float(value):
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
 def request_shape(value):
     parts = value.split(":")
     if len(parts) != 3:
@@ -83,6 +90,11 @@ def parse_args():
     parser.add_argument("--input-length", type=positive_int, required=True)
     parser.add_argument("--output-length", type=positive_int, required=True)
     parser.add_argument("--num-requests-per-replica", type=positive_int, default=120)
+    parser.add_argument(
+        "--duration-seconds",
+        type=positive_float,
+        help="generate arrivals for this duration on each replica",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--arrival-pattern",
@@ -140,6 +152,8 @@ def build_worker_command(args, worker_index, output_path):
     ]
     for total_rate in args.request_rate:
         command.extend(("--request-rate", str(total_rate / replica_rate_divisor)))
+    if args.duration_seconds is not None:
+        command.extend(("--duration-seconds", str(args.duration_seconds)))
     for input_length, output_length, weight in args.request_shape or []:
         command.extend(
             (
@@ -350,6 +364,7 @@ def main():
             "request_shapes": args.request_shape,
             "seed": args.seed,
             "num_requests_per_replica": args.num_requests_per_replica,
+            "arrival_duration_seconds": args.duration_seconds,
             "max_batch_size": args.max_batch_size,
             "decode_attention_backend": args.decode_attention_backend,
             "offered_request_rates": args.request_rate,
