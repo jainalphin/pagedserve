@@ -108,6 +108,12 @@ larger corpus before making a production-quality claim.
 
 ## Ten-minute production-style comparison
 
+> **Historical result notice:** this comparison predates benchmark schema 4.
+> PagedServe and vLLM did not share a single total-device memory-utilization
+> target, and aggregate throughput used the former per-replica rate-sum method.
+> Do not use this table for cross-engine VRAM efficiency or capacity-superiority
+> claims; re-run it with the current benchmark first.
+
 Three independent trials per engine used two Tesla T4 replicas, FP16 GPT-2,
 Poisson arrivals at 60 total offered RPS, and 18,000 requests per replica. Each
 trial therefore contained 36,000 requests and approximately ten minutes of

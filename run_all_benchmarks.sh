@@ -13,11 +13,12 @@ RUN_TESTS=true
 RUN_SHORT=true
 RUN_LONG=true
 RUN_PRODUCTION=false
-REPETITIONS=1
+REPETITIONS=3
 REQUESTS_PER_REPLICA=120
 DURATION_SECONDS=""
 MAX_BATCH_SIZE=128
 KV_CACHE_SAFETY_MB=3072
+GPU_MEMORY_UTILIZATION=0.8
 DECODE_ATTENTION_BACKEND="torch"
 TTFT_SLO_MS=""
 TPOT_SLO_MS=""
@@ -46,11 +47,14 @@ Options:
   --max-batch-size N            Maximum sequences per worker (default: 128).
   --kv-cache-safety-mb N        VRAM retained outside PagedServe KV cache
                                 (default: 3072).
+  --gpu-memory-utilization F    Shared total-device memory target for PagedServe
+                                and vLLM (default: 0.8).
   --decode-attention-backend B  PagedServe decode backend: torch or triton.
   --short-rate RPS              Repeat to replace short-context rates.
   --long-rate RPS               Repeat to replace long-context rates.
   --production-rate RPS         Repeat to replace mixed production-like rates.
-  --repetitions N               Repeat every case with a new deterministic seed.
+  --repetitions N               Repeat every case with a new deterministic seed
+                                (default: 3; use 1 only for smoke tests).
   --ttft-slo-ms MS              Optional per-request TTFT objective.
   --tpot-slo-ms MS              Optional per-token latency objective.
   --e2e-slo-ms MS               Optional per-request E2E objective.
@@ -68,7 +72,7 @@ Defaults:
   Engines: HF, PagedServe Orca, PagedServe Sarathi, and vLLM
   Short rates: 30, 40, 50, 60, 70, 80 RPS
   Long rates: 4, 8, 12, 16, 20, 30 RPS
-  Production-like rates: 30, 50, 60, 80, 100, 120 RPS
+  Production-like rates: 30, 50, 60, 80, 100, 120, 140, 160 RPS
 
 Production-like mix: 50% 128+32, 30% 384+64, 15% 768+96, and
 5% 900+64 tokens with independent Poisson arrivals on each replica.
@@ -119,6 +123,11 @@ while [[ $# -gt 0 ]]; do
     --kv-cache-safety-mb)
       require_value "$@"
       KV_CACHE_SAFETY_MB="$2"
+      shift 2
+      ;;
+    --gpu-memory-utilization)
+      require_value "$@"
+      GPU_MEMORY_UTILIZATION="$2"
       shift 2
       ;;
     --decode-attention-backend)
@@ -223,7 +232,7 @@ if [[ ${#LONG_RATES[@]} -eq 0 ]]; then
   LONG_RATES=(4 8 12 16 20 30)
 fi
 if [[ ${#PRODUCTION_RATES[@]} -eq 0 ]]; then
-  PRODUCTION_RATES=(30 50 60 80 100 120)
+  PRODUCTION_RATES=(30 50 60 80 100 120 140 160)
 fi
 
 if [[ ! "$REQUESTS_PER_REPLICA" =~ ^[1-9][0-9]*$ ]]; then
@@ -241,6 +250,11 @@ if [[ ! "$MAX_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "$KV_CACHE_SAFETY_MB" =~ ^[1-9][0-9]*$ ]]; then
   echo "--kv-cache-safety-mb must be a positive integer" >&2
+  exit 2
+fi
+if ! awk -v value="$GPU_MEMORY_UTILIZATION" \
+    'BEGIN { exit !(value + 0 > 0 && value + 0 <= 1) }'; then
+  echo "--gpu-memory-utilization must be in (0, 1]" >&2
   exit 2
 fi
 if [[ ! "$REPETITIONS" =~ ^[1-9][0-9]*$ ]]; then
@@ -267,6 +281,7 @@ mkdir -p "$RESULT_ROOT"
   echo "duration_seconds=${DURATION_SECONDS:-request-count-driven}"
   echo "max_batch_size=$MAX_BATCH_SIZE"
   echo "kv_cache_safety_mb=$KV_CACHE_SAFETY_MB"
+  echo "gpu_memory_utilization=$GPU_MEMORY_UTILIZATION"
   echo "decode_attention_backend=$DECODE_ATTENTION_BACKEND"
   echo "models=${MODELS[*]}"
   echo "engines=${ENGINES[*]}"
@@ -326,6 +341,7 @@ run_case() {
     --num-requests-per-replica "$REQUESTS_PER_REPLICA"
     --max-batch-size "$MAX_BATCH_SIZE"
     --kv-cache-safety-mb "$KV_CACHE_SAFETY_MB"
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
     --seed "$((1234 + (trial - 1) * 10000))"
     --output-dir "$case_dir/raw"
   )

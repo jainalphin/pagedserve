@@ -26,7 +26,6 @@ import torch
 
 from benchmark import positive_integer
 from main import (
-    DEFAULT_CUDA_KV_MEMORY_UTILIZATION,
     DEFAULT_CUDA_KV_SAFETY_MB,
     GPT2_MODEL,
     SUPPORTED_DECODE_ATTENTION_BACKENDS,
@@ -469,6 +468,26 @@ def request_metrics(record):
     }
 
 
+def summarize_metric_group(items):
+    """Summarize one homogeneous request-shape group."""
+    metrics = [item[1] for item in items]
+    return {
+        "request_count": len(items),
+        "ttft_seconds": summarize([item["ttft"] for item in metrics]),
+        "queue_delay_seconds": summarize(
+            [item["queue_delay"] for item in metrics]
+        ),
+        "engine_ttft_seconds": summarize(
+            [item["engine_ttft"] for item in metrics]
+        ),
+        "tpot_seconds": summarize([item["tpot"] for item in metrics]),
+        "itl_seconds": summarize(
+            [interval for item in metrics for interval in item["itls"]]
+        ),
+        "e2e_seconds": summarize([item["e2e"] for item in metrics]),
+    }
+
+
 def summarize_scenario(
     engine,
     request_rate,
@@ -498,14 +517,18 @@ def summarize_scenario(
                 }
             )
         else:
-            completed.append(metrics)
+            completed.append((record, metrics))
 
-    ttfts = [metrics["ttft"] for metrics in completed]
-    queue_delays = [metrics["queue_delay"] for metrics in completed]
-    engine_ttfts = [metrics["engine_ttft"] for metrics in completed]
-    e2es = [metrics["e2e"] for metrics in completed]
-    tpots = [metrics["tpot"] for metrics in completed]
-    itls = [interval for metrics in completed for interval in metrics["itls"]]
+    ttfts = [metrics["ttft"] for _, metrics in completed]
+    queue_delays = [metrics["queue_delay"] for _, metrics in completed]
+    engine_ttfts = [metrics["engine_ttft"] for _, metrics in completed]
+    e2es = [metrics["e2e"] for _, metrics in completed]
+    tpots = [metrics["tpot"] for _, metrics in completed]
+    itls = [
+        interval
+        for _, metrics in completed
+        for interval in metrics["itls"]
+    ]
 
     def meets_slo(metrics):
         checks = []
@@ -522,9 +545,10 @@ def summarize_scenario(
         for value in (ttft_slo_ms, tpot_slo_ms, e2e_slo_ms)
     )
     good_requests = (
-        sum(meets_slo(metrics) for metrics in completed) if has_slo else None
+        sum(meets_slo(metrics) for _, metrics in completed) if has_slo else None
     )
-    generated_tokens = sum(len(record.token_times) for record in records)
+    generated_tokens = sum(len(record.token_times) for record, _ in completed)
+    all_generated_tokens = sum(len(record.token_times) for record in records)
     scheduled_arrivals = sorted(record.scheduled_arrival for record in records)
     arrival_intervals = [
         current - previous
@@ -557,6 +581,28 @@ def summarize_scenario(
         )
         telemetry["estimated_joules_per_successful_request"] = (
             estimated_energy / len(completed) if completed else None
+        )
+    shape_groups = {}
+    for record, metrics in completed:
+        shape = (
+            record.requested_input_length,
+            record.requested_output_length or output_length,
+        )
+        shape_groups.setdefault(shape, []).append((record, metrics))
+    latency_by_request_shape = []
+    for (input_tokens, output_tokens), items in sorted(
+        shape_groups.items(),
+        key=lambda item: (
+            -1 if item[0][0] is None else item[0][0],
+            item[0][1],
+        ),
+    ):
+        latency_by_request_shape.append(
+            {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                **summarize_metric_group(items),
+            }
         )
     raw_requests = []
     for record in records:
@@ -592,19 +638,32 @@ def summarize_scenario(
         "arrival_interval_seconds": summarize(arrival_intervals),
         "peak_outstanding_requests": peak_outstanding,
         "successful_requests": len(completed),
+        "slo_good_requests": good_requests,
         "failed_requests": failed,
         "achieved_request_throughput": len(completed) / duration,
+        "offered_load_delivery_ratio": (
+            (len(completed) / duration) / request_rate
+            if not math.isinf(request_rate)
+            else None
+        ),
+        "throughput_is_demand_limited": (
+            len(completed) / duration >= 0.99 * request_rate
+            if not math.isinf(request_rate)
+            else False
+        ),
         "goodput_requests_per_second": (
             good_requests / duration if good_requests is not None else None
         ),
         "output_token_throughput": generated_tokens / duration,
         "generated_tokens": generated_tokens,
+        "all_generated_tokens_including_failed_requests": all_generated_tokens,
         "ttft_seconds": summarize(ttfts),
         "queue_delay_seconds": summarize(queue_delays),
         "engine_ttft_seconds": summarize(engine_ttfts),
         "tpot_seconds": summarize(tpots),
         "itl_seconds": summarize(itls),
         "e2e_seconds": summarize(e2es),
+        "latency_by_request_shape": latency_by_request_shape,
         "gpu_telemetry": telemetry,
         "raw_requests": raw_requests,
     }
@@ -761,9 +820,17 @@ async def consume_vllm_request(
                 continue
             new_token_ids = output.outputs[0].token_ids
             if new_token_ids:
+                if len(new_token_ids) != 1:
+                    record.error = (
+                        "vLLM returned multiple tokens in one DELTA callback; "
+                        "per-token timestamps would be ambiguous. Disable output "
+                        "coalescing or speculative/multi-step decoding for this "
+                        "latency benchmark."
+                    )
+                    return
                 token_time = time.perf_counter() - benchmark_start
-                record.token_times.extend([token_time] * len(new_token_ids))
-                record.token_ids.extend(int(token_id) for token_id in new_token_ids)
+                record.token_times.append(token_time)
+                record.token_ids.append(int(new_token_ids[0]))
     except Exception as error:
         record.error = f"{type(error).__name__}: {error}"
 
@@ -980,7 +1047,10 @@ def parse_args():
     parser.add_argument(
         "--kv-cache-memory-utilization",
         type=float,
-        default=DEFAULT_CUDA_KV_MEMORY_UTILIZATION,
+        help=(
+            "PagedServe-only override. By default PagedServe uses the same "
+            "--gpu-memory-utilization target as vLLM."
+        ),
     )
     parser.add_argument(
         "--kv-cache-safety-mb",
@@ -1033,7 +1103,10 @@ def validate_args(args):
         raise ValueError("a request shape exceeds max_model_len")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
-    if not 0 < args.kv_cache_memory_utilization <= 1:
+    if (
+        args.kv_cache_memory_utilization is not None
+        and not 0 < args.kv_cache_memory_utilization <= 1
+    ):
         raise ValueError("kv_cache_memory_utilization must be in (0, 1]")
     if args.warmup_batch_size > args.max_batch_size:
         raise ValueError("warmup_batch_size cannot exceed max_batch_size")
@@ -1045,8 +1118,20 @@ def validate_args(args):
 
 
 def base_report(args, input_lengths, output_lengths):
+    pagedserve_memory_utilization = (
+        args.kv_cache_memory_utilization
+        if args.kv_cache_memory_utilization is not None
+        else args.gpu_memory_utilization
+    )
+    memory_budget_comparable = (
+        args.kv_cache_memory_mb is None
+        and math.isclose(
+            pagedserve_memory_utilization,
+            args.gpu_memory_utilization,
+        )
+    )
     return {
-        "profile_schema_version": 3,
+        "profile_schema_version": 4,
         "system": system_metadata(),
         "gpu_lifecycle": {
             "before_engine_initialization": nvidia_smi_snapshot(),
@@ -1097,7 +1182,7 @@ def base_report(args, input_lengths, output_lengths):
             "max_batch_size": args.max_batch_size,
             "warmup_batch_size": args.warmup_batch_size,
             "kv_cache_memory_mb": args.kv_cache_memory_mb,
-            "kv_cache_memory_utilization": args.kv_cache_memory_utilization,
+            "kv_cache_memory_utilization": pagedserve_memory_utilization,
             "kv_cache_safety_mb": args.kv_cache_safety_mb,
             "prefill_chunk_size": args.prefill_chunk_size,
             "pagedserve_strategy": args.pagedserve_strategy,
@@ -1105,6 +1190,12 @@ def base_report(args, input_lengths, output_lengths):
             "kv_cache_dtype": args.kv_cache_dtype,
             "cuda_graphs_enabled": not args.disable_cuda_graphs,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "memory_budget_comparable_across_engines": memory_budget_comparable,
+            "memory_budget_policy": (
+                "shared_total_device_utilization_target"
+                if memory_budget_comparable
+                else "engine_specific_override"
+            ),
             "vllm_enforce_eager": args.vllm_enforce_eager,
             "ttft_slo_ms": args.ttft_slo_ms,
             "tpot_slo_ms": args.tpot_slo_ms,
@@ -1139,7 +1230,11 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
         prefill_chunk_size=args.prefill_chunk_size,
         max_batch_size=args.max_batch_size,
         kv_cache_memory_mb=args.kv_cache_memory_mb,
-        kv_cache_memory_utilization=args.kv_cache_memory_utilization,
+        kv_cache_memory_utilization=(
+            args.kv_cache_memory_utilization
+            if args.kv_cache_memory_utilization is not None
+            else args.gpu_memory_utilization
+        ),
         kv_cache_safety_mb=args.kv_cache_safety_mb,
         execution_dtype=args.dtype,
         decode_attention_backend=args.decode_attention_backend,
@@ -1351,7 +1446,7 @@ def print_report(report):
     print(
         "engine | offered RPS | achieved RPS | goodput RPS | output tok/s | "
         "TTFT p50/p95/p99 (ms) | TPOT p50/p95/p99 (ms) | "
-        "E2E p50/p95/p99 (ms) | failures"
+        "ITL p50/p95/p99 (ms) | E2E p50/p95/p99 (ms) | failures"
     )
     print("-" * 145)
 
@@ -1367,6 +1462,7 @@ def print_report(report):
     for result in report["results"]:
         ttft = result["ttft_seconds"]
         tpot = result["tpot_seconds"]
+        itl = result["itl_seconds"]
         e2e = result["e2e_seconds"]
         goodput = result["goodput_requests_per_second"]
         goodput_text = "n/a" if goodput is None else f"{goodput:.3f}"
@@ -1377,6 +1473,7 @@ def print_report(report):
             f"{result['output_token_throughput']:.2f} | "
             f"{latency_triplet(ttft)} | "
             f"{latency_triplet(tpot)} | "
+            f"{latency_triplet(itl)} | "
             f"{latency_triplet(e2e)} | "
             f"{len(result['failed_requests'])}"
         )
@@ -1392,6 +1489,25 @@ def print_report(report):
             f"  realized arrivals: {realized_text} RPS | "
             f"peak outstanding requests: {result['peak_outstanding_requests']}"
         )
+        if result["offered_request_rate"] != "inf":
+            load_label = (
+                "demand-limited; not a maximum-capacity measurement"
+                if result["throughput_is_demand_limited"]
+                else "did not keep up with offered load"
+            )
+            print(
+                f"  delivered {result['offered_load_delivery_ratio'] * 100:.2f}% "
+                f"of offered RPS | {load_label}"
+            )
+        for shape in result["latency_by_request_shape"]:
+            print(
+                f"  shape {shape['input_tokens']}+{shape['output_tokens']} "
+                f"(n={shape['request_count']}): "
+                f"TTFT {latency_triplet(shape['ttft_seconds'])} ms | "
+                f"TPOT {latency_triplet(shape['tpot_seconds'])} ms | "
+                f"ITL {latency_triplet(shape['itl_seconds'])} ms | "
+                f"E2E {latency_triplet(shape['e2e_seconds'])} ms"
+            )
 
     for result in report["results"]:
         telemetry = result["gpu_telemetry"]

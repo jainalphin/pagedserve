@@ -6,6 +6,7 @@ rate. GPU memory is not combined: every worker owns its model and KV cache.
 
 import argparse
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -110,7 +111,14 @@ def parse_args():
     parser.add_argument("--gpu", action="append", help="physical GPU id (default: 0 and 1)")
     parser.add_argument("--max-batch-size", type=positive_int, default=64)
     parser.add_argument("--kv-cache-memory-mb", type=positive_int)
-    parser.add_argument("--kv-cache-memory-utilization", type=float, default=0.90)
+    parser.add_argument(
+        "--kv-cache-memory-utilization",
+        type=float,
+        help=(
+            "PagedServe-only override. Omit it for a fair comparison using "
+            "--gpu-memory-utilization for both engines."
+        ),
+    )
     parser.add_argument("--kv-cache-safety-mb", type=positive_int, default=3072)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--ttft-slo-ms", type=float)
@@ -163,6 +171,11 @@ def build_worker_command(args, worker_index, output_path):
         )
 
     if args.engine == "pagedserve":
+        pagedserve_memory_utilization = (
+            args.kv_cache_memory_utilization
+            if args.kv_cache_memory_utilization is not None
+            else args.gpu_memory_utilization
+        )
         command.extend(
             (
                 "--pagedserve-strategy",
@@ -170,9 +183,11 @@ def build_worker_command(args, worker_index, output_path):
                 "--decode-attention-backend",
                 args.decode_attention_backend,
                 "--kv-cache-memory-utilization",
-                str(args.kv_cache_memory_utilization),
+                str(pagedserve_memory_utilization),
                 "--kv-cache-safety-mb",
                 str(args.kv_cache_safety_mb),
+                "--warmup-batch-size",
+                str(args.max_batch_size),
             )
         )
         if args.kv_cache_memory_mb is not None:
@@ -197,37 +212,96 @@ def combine_rate(worker_results, total_offered_rate):
         request
         for result in worker_results
         for request in result["raw_requests"]
-        if request["error"] is None
+        if (
+            request["error"] is None
+            and request["generated_tokens"] == request["requested_output_tokens"]
+            and request["ttft_seconds"] is not None
+        )
     ]
     ttfts = [request["ttft_seconds"] for request in raw_requests]
     queue_delays = [request["queue_delay_seconds"] for request in raw_requests]
     engine_ttfts = [request["engine_ttft_seconds"] for request in raw_requests]
     tpots = [request["tpot_seconds"] for request in raw_requests]
+    itls = [
+        interval
+        for request in raw_requests
+        for interval in request["inter_token_seconds"]
+    ]
     e2es = [request["e2e_seconds"] for request in raw_requests]
-    goodputs = [result["goodput_requests_per_second"] for result in worker_results]
+    durations = [result["duration_seconds"] for result in worker_results]
+    measurement_duration = max(durations)
+    successful_requests = sum(
+        result["successful_requests"] for result in worker_results
+    )
+    generated_tokens = sum(
+        result["generated_tokens"] for result in worker_results
+    )
+    slo_good_counts = [result.get("slo_good_requests") for result in worker_results]
     realized_rates = [
         result["realized_arrival_rate"]
         for result in worker_results
         if result["realized_arrival_rate"] is not None
     ]
+    shape_groups = {}
+    for request in raw_requests:
+        shape = (request["input_tokens"], request["requested_output_tokens"])
+        shape_groups.setdefault(shape, []).append(request)
+    latency_by_request_shape = []
+    for (input_tokens, output_tokens), requests in sorted(
+        shape_groups.items(),
+        key=lambda item: (
+            -1 if item[0][0] is None else item[0][0],
+            item[0][1],
+        ),
+    ):
+        latency_by_request_shape.append(
+            {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "request_count": len(requests),
+                "ttft_seconds": latency_summary(
+                    [request["ttft_seconds"] for request in requests]
+                ),
+                "tpot_seconds": latency_summary(
+                    [request["tpot_seconds"] for request in requests]
+                ),
+                "itl_seconds": latency_summary(
+                    [
+                        interval
+                        for request in requests
+                        for interval in request["inter_token_seconds"]
+                    ]
+                ),
+                "e2e_seconds": latency_summary(
+                    [request["e2e_seconds"] for request in requests]
+                ),
+            }
+        )
+    achieved_throughput = successful_requests / measurement_duration
+    output_throughput = generated_tokens / measurement_duration
     return {
         "offered_request_rate": total_offered_rate,
         "realized_arrival_rate": sum(realized_rates) if realized_rates else None,
         "peak_outstanding_requests_per_gpu": [
             result["peak_outstanding_requests"] for result in worker_results
         ],
-        "achieved_request_throughput": sum(
+        "aggregate_measurement_duration_seconds": measurement_duration,
+        "per_replica_duration_seconds": durations,
+        "achieved_request_throughput": achieved_throughput,
+        "output_token_throughput": output_throughput,
+        "replica_rate_sum_request_throughput": sum(
             result["achieved_request_throughput"] for result in worker_results
         ),
-        "output_token_throughput": sum(
+        "replica_rate_sum_output_token_throughput": sum(
             result["output_token_throughput"] for result in worker_results
         ),
         "goodput_requests_per_second": (
-            sum(goodputs) if all(value is not None for value in goodputs) else None
+            sum(slo_good_counts) / measurement_duration
+            if all(value is not None for value in slo_good_counts)
+            else None
         ),
-        "successful_requests": sum(
-            result["successful_requests"] for result in worker_results
-        ),
+        "successful_requests": successful_requests,
+        "generated_tokens": generated_tokens,
         "failed_requests": sum(
             len(result["failed_requests"]) for result in worker_results
         ),
@@ -235,7 +309,13 @@ def combine_rate(worker_results, total_offered_rate):
         "queue_delay_seconds": latency_summary(queue_delays),
         "engine_ttft_seconds": latency_summary(engine_ttfts),
         "tpot_seconds": latency_summary(tpots),
+        "itl_seconds": latency_summary(itls),
         "e2e_seconds": latency_summary(e2es),
+        "latency_by_request_shape": latency_by_request_shape,
+        "offered_load_delivery_ratio": achieved_throughput / total_offered_rate,
+        "throughput_is_demand_limited": (
+            achieved_throughput >= 0.99 * total_offered_rate
+        ),
         "per_gpu_telemetry": [
             result["gpu_telemetry"] for result in worker_results
         ],
@@ -257,7 +337,10 @@ def main():
     args.gpu = args.gpu or ["0", "1"]
     if len(args.gpu) < 2 or len(args.gpu) != len(set(args.gpu)):
         raise ValueError("Provide at least two unique GPU ids")
-    if not 0 < args.kv_cache_memory_utilization <= 1:
+    if (
+        args.kv_cache_memory_utilization is not None
+        and not 0 < args.kv_cache_memory_utilization <= 1
+    ):
         raise ValueError("kv_cache_memory_utilization must be in (0, 1]")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
@@ -345,7 +428,7 @@ def main():
         for index, total_rate in enumerate(args.request_rate)
     ]
     aggregate_report = {
-        "profile_schema_version": 3,
+        "profile_schema_version": 4,
         "engine": args.engine,
         "pagedserve_strategy": (
             args.pagedserve_strategy if args.engine == "pagedserve" else None
@@ -369,12 +452,35 @@ def main():
             "decode_attention_backend": args.decode_attention_backend,
             "offered_request_rates": args.request_rate,
             "kv_cache_memory_mb": args.kv_cache_memory_mb,
-            "kv_cache_memory_utilization": args.kv_cache_memory_utilization,
+            "kv_cache_memory_utilization": (
+                args.kv_cache_memory_utilization
+                if args.kv_cache_memory_utilization is not None
+                else args.gpu_memory_utilization
+            ),
             "kv_cache_safety_mb": args.kv_cache_safety_mb,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "memory_budget_comparable_across_engines": (
+                args.kv_cache_memory_mb is None
+                and (
+                    args.kv_cache_memory_utilization is None
+                    or math.isclose(
+                        args.kv_cache_memory_utilization,
+                        args.gpu_memory_utilization,
+                    )
+                )
+            ),
             "ttft_slo_ms": args.ttft_slo_ms,
             "tpot_slo_ms": args.tpot_slo_ms,
             "e2e_slo_ms": args.e2e_slo_ms,
+        },
+        "claim_guidance": {
+            "throughput_capacity_requires_saturation_sweep": True,
+            "sustainable_capacity_requires_an_slo": True,
+            "mixed_workload_tail_latency_requires_shape_breakdown": True,
+            "peak_vram_is_a_preallocated_budget_not_memory_efficiency": True,
+            "memory_efficiency_metric": (
+                "KV-cache token capacity under the shared total-device cap"
+            ),
         },
         "per_gpu_engine_metadata": [
             report["engine_metadata"] for report in reports
@@ -384,10 +490,29 @@ def main():
     }
     aggregate_path = args.output_dir / "aggregate.json"
     aggregate_path.write_text(json.dumps(aggregate_report, indent=2) + "\n")
+    comparable_memory = aggregate_report["settings"][
+        "memory_budget_comparable_across_engines"
+    ]
+    print(
+        "Memory budget: "
+        f"{args.gpu_memory_utilization * 100:.1f}% total-device utilization target | "
+        f"fair cross-engine budget={'yes' if comparable_memory else 'no'}"
+    )
+    if not comparable_memory:
+        print(
+            "WARNING: engine-specific KV memory settings were supplied; do not "
+            "make cross-engine VRAM-efficiency claims from this run."
+        )
+    else:
+        print(
+            "Peak device VRAM includes preallocated KV pools; treat it as budget "
+            "usage, not memory efficiency. Compare KV-token capacity under this "
+            "shared cap instead."
+        )
     print(
         "total offered RPS | aggregate achieved RPS | SLO goodput RPS | output tok/s | "
         "TTFT p50/p95/p99 (ms) | TPOT p50/p95/p99 (ms) | "
-        "E2E p50/p95/p99 (ms) | failures"
+        "ITL p50/p95/p99 (ms) | E2E p50/p95/p99 (ms) | failures"
     )
     print("-" * 150)
     for result in combined:
@@ -400,6 +525,7 @@ def main():
             f"{result['output_token_throughput']:.2f} | "
             f"{triplet(result['ttft_seconds'])} | "
             f"{triplet(result['tpot_seconds'])} | "
+            f"{triplet(result['itl_seconds'])} | "
             f"{triplet(result['e2e_seconds'])} | "
             f"{result['failed_requests']}"
         )
@@ -416,6 +542,23 @@ def main():
             f"peak outstanding per GPU "
             f"{result['peak_outstanding_requests_per_gpu']}"
         )
+        load_label = (
+            "demand-limited; this row does not measure maximum capacity"
+            if result["throughput_is_demand_limited"]
+            else "did not keep up with offered load"
+        )
+        print(
+            f"  delivered {result['offered_load_delivery_ratio'] * 100:.2f}% "
+            f"of offered RPS | {load_label}"
+        )
+        for shape in result["latency_by_request_shape"]:
+            print(
+                f"  shape {shape['input_tokens']}+{shape['output_tokens']} "
+                f"(n={shape['request_count']}): TTFT {triplet(shape['ttft_seconds'])} ms | "
+                f"TPOT {triplet(shape['tpot_seconds'])} ms | "
+                f"ITL {triplet(shape['itl_seconds'])} ms | "
+                f"E2E {triplet(shape['e2e_seconds'])} ms"
+            )
         for gpu_id, telemetry in zip(args.gpu, result["per_gpu_telemetry"]):
             if not telemetry or not telemetry.get("sample_count"):
                 continue

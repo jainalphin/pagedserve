@@ -94,6 +94,12 @@ PYTHONPATH=. python main.py \
   --decode-attention-backend triton
 ```
 
+For reproducible vLLM comparisons, install the pinned benchmark environment:
+
+```bash
+pip install -r requirements-vllm.txt
+```
+
 Supported Triton query/output dtypes are FP16, BF16, and FP32. Floating-point KV
 storage must match the query dtype. Head dimensions up to 256 and power-of-two KV
 page sizes are supported; the engine uses 16-token pages. Triton decode is
@@ -443,7 +449,10 @@ being combined with FP16 results.
 Two T4s do not provide one unified memory pool. For GPT-2 throughput, use one
 independent replica per GPU and split incoming requests evenly. The following
 commands run both replicas concurrently and report aggregate RPS plus per-GPU
-utilization. Do not set `CUDA_VISIBLE_DEVICES=0` around these commands.
+utilization. Do not set `CUDA_VISIBLE_DEVICES=0` around these commands. Both
+PagedServe and vLLM use the same 80% total-device memory target by default.
+Supplying a PagedServe-only KV-memory override marks the result as unsuitable for
+cross-engine VRAM-efficiency claims.
 
 Short-context PagedServe capacity around the 50–60 RPS target:
 
@@ -528,10 +537,18 @@ Each worker profile records:
 - offered/achieved RPS, successful and failed requests, output tokens/s, SLO
   goodput, client queue delay, engine TTFT after submission, and total
   TTFT/TPOT/ITL/E2E distributions including p50, p95, and p99;
+- the same latency distributions split by input/output request shape, so mixed
+  workload percentiles cannot hide shape-specific reversals;
 - sampled GPU kernel activity, memory-controller activity, VRAM, power draw, power
   limit, and estimated energy per run, output token, and successful request.
 
-The device-wide `nvidia-smi` memory reading is the cross-engine comparison value.
+The device-wide `nvidia-smi` memory reading is the cross-engine reserved-memory
+value. The runner applies one shared `--gpu-memory-utilization` target to both
+engines; capacity and latency comparisons are fair only when
+`memory_budget_comparable_across_engines` is true. Because both engines
+preallocate KV pools, peak VRAM mostly shows consumption of that configured
+budget—not intrinsic memory efficiency. For memory-efficiency claims, compare
+usable KV-token capacity under the same total-device cap.
 PyTorch allocator counters are supplementary because an engine may own memory
 outside PyTorch's caching allocator. Power-derived energy is an estimate from the
 configured sampling interval, not a hardware energy-counter measurement. This
@@ -568,6 +585,8 @@ bash run_all_benchmarks.sh \
   --production-rate 80 \
   --production-rate 100 \
   --production-rate 120 \
+  --production-rate 140 \
+  --production-rate 160 \
   --duration-seconds 600 \
   --repetitions 3 \
   --ttft-slo-ms YOUR_TTFT_LIMIT \
@@ -582,7 +601,10 @@ adding, respectively, `--engine pagedserve-orca
 --decode-attention-backend triton`, or `--engine vllm`. A duration applies to
 each rate and repetition; overloaded engines are allowed to drain after arrivals
 stop, so their wall-clock run can exceed ten minutes. Publish medians across the
-three trials and retain p95/p99 request latencies from every trial.
+three trials and retain p95/p99 request latencies from every trial. A row marked
+`demand-limited` only shows that an engine kept up with that offered rate; it is
+not a maximum-capacity result. Claim sustainable capacity only from an
+above-saturation sweep with a stated TTFT, TPOT, or E2E SLO.
 
 The built-in production-like mix is 50% 128-input/32-output, 30% 384/64,
 15% 768/96, and 5% 900/64. These are explicit starting assumptions, not claims

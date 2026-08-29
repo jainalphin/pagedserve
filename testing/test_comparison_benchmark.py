@@ -195,11 +195,11 @@ def test_request_metrics_separate_queue_delay_from_engine_ttft():
     assert math.isclose(metrics["ttft"], 0.35)
 
 
-def test_vllm_delta_stream_records_each_generated_token_once():
+def test_vllm_delta_stream_records_single_token_callbacks():
     class FakeVLLMEngine:
         async def generate(self, **kwargs):
             assert kwargs["prompt"] == {"prompt_token_ids": [10, 11]}
-            for token_ids in ([20], [21, 22]):
+            for token_ids in ([20], [21], [22]):
                 yield SimpleNamespace(
                     outputs=[SimpleNamespace(token_ids=token_ids)]
                 )
@@ -217,6 +217,100 @@ def test_vllm_delta_stream_records_each_generated_token_once():
     assert record.error is None
     assert record.token_ids == [20, 21, 22]
     assert len(record.token_times) == 3
+
+
+def test_vllm_delta_stream_rejects_ambiguous_multi_token_callback():
+    class FakeVLLMEngine:
+        async def generate(self, **kwargs):
+            yield SimpleNamespace(
+                outputs=[SimpleNamespace(token_ids=[20, 21])]
+            )
+
+    record = RequestRecord(request_index=0, scheduled_arrival=0.0)
+    asyncio.run(
+        consume_vllm_request(
+            FakeVLLMEngine(),
+            sampling_params=object(),
+            prompt=[10, 11],
+            record=record,
+            benchmark_start=time.perf_counter(),
+        )
+    )
+    assert "timestamps would be ambiguous" in record.error
+    assert not record.token_ids
+    assert not record.token_times
+
+
+def test_summary_reports_each_request_shape_separately():
+    records = [
+        RequestRecord(
+            request_index=0,
+            scheduled_arrival=0.0,
+            requested_input_length=128,
+            requested_output_length=2,
+            token_times=[0.1, 0.2],
+            token_ids=[1, 2],
+        ),
+        RequestRecord(
+            request_index=1,
+            scheduled_arrival=0.0,
+            requested_input_length=900,
+            requested_output_length=3,
+            token_times=[0.3, 0.5, 0.7],
+            token_ids=[3, 4, 5],
+        ),
+    ]
+    summary = summarize_scenario(
+        engine="test",
+        request_rate=1.0,
+        records=records,
+        duration=1.0,
+        output_length=2,
+        telemetry=None,
+        ttft_slo_ms=None,
+        tpot_slo_ms=None,
+        e2e_slo_ms=None,
+    )
+    shapes = summary["latency_by_request_shape"]
+    assert [(item["input_tokens"], item["output_tokens"]) for item in shapes] == [
+        (128, 2),
+        (900, 3),
+    ]
+    assert [item["request_count"] for item in shapes] == [1, 1]
+    assert math.isclose(shapes[0]["e2e_seconds"]["p95"], 0.2)
+    assert math.isclose(shapes[1]["tpot_seconds"]["p95"], 0.2)
+
+
+def test_failed_partial_request_does_not_inflate_successful_token_throughput():
+    complete = RequestRecord(
+        request_index=0,
+        scheduled_arrival=0.0,
+        requested_output_length=2,
+        token_times=[0.1, 0.2],
+        token_ids=[1, 2],
+    )
+    partial = RequestRecord(
+        request_index=1,
+        scheduled_arrival=0.0,
+        requested_output_length=2,
+        token_times=[0.1],
+        token_ids=[3],
+        error="failed",
+    )
+    summary = summarize_scenario(
+        engine="test",
+        request_rate=2.0,
+        records=[complete, partial],
+        duration=1.0,
+        output_length=2,
+        telemetry=None,
+        ttft_slo_ms=None,
+        tpot_slo_ms=None,
+        e2e_slo_ms=None,
+    )
+    assert summary["generated_tokens"] == 2
+    assert summary["all_generated_tokens_including_failed_requests"] == 3
+    assert summary["output_token_throughput"] == 2
 
 
 def test_gpu_monitor_targets_only_the_first_cuda_visible_device(monkeypatch):

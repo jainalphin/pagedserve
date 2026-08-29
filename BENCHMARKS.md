@@ -135,6 +135,12 @@ therefore the CUDA matrix, where batching can use GPU parallelism.
 
 ## NVIDIA Tesla T4 GPU — 18 August 2026
 
+> **Historical result notice:** these runs predate benchmark schema 4 and did
+> not apply one shared total-device memory target to every engine. Retain them as
+> implementation history, but do not use them for cross-engine VRAM efficiency
+> or maximum/sustainable-capacity claims. Re-run the current fair-memory,
+> shape-stratified saturation sweep before publishing a vLLM comparison.
+
 These measurements use one of the two T4s in a Kaggle instance. Restricting every
 engine to the same GPU avoids giving vLLM a two-GPU advantage that PagedServe cannot
 currently use.
