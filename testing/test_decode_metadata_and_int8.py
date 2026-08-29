@@ -116,6 +116,24 @@ def test_inference_buffers_and_offset_patterns_are_reused():
     assert first_offsets.data_ptr() == second_offsets.data_ptr()
 
 
+def test_inference_buffer_cache_does_not_grow_for_mixed_shapes():
+    manager = _manager()
+    attention = PagedAttention(manager)
+    reference = torch.randn(2, 2, 8)
+    with torch.inference_mode():
+        small = attention._inference_buffer("mixed", reference, (2, 2, 8))
+        large = attention._inference_buffer("mixed", reference, (8, 2, 8))
+        smaller_again = attention._inference_buffer(
+            "mixed", reference, (3, 2, 8)
+        )
+
+    assert small.shape == (2, 2, 8)
+    assert large.shape == (8, 2, 8)
+    assert smaller_again.shape == (3, 2, 8)
+    assert len(attention._inference_buffers) == 1
+    assert smaller_again.data_ptr() == large.data_ptr()
+
+
 def test_packed_decode_metadata_storage_is_reused_in_inference_mode():
     manager = _manager()
     manager.store_prefill_request(

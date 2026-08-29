@@ -1,3 +1,4 @@
+import math
 from typing import Dict, Sequence, Tuple
 
 import torch
@@ -32,12 +33,22 @@ class PagedAttention:
         shape = tuple(reference.shape if shape is None else shape)
         if not torch.is_inference_mode_enabled():
             return torch.empty(shape, dtype=reference.dtype, device=reference.device)
-        key = (name, reference.device, reference.dtype, shape)
+        # Mixed request shapes can produce thousands of distinct flattened token
+        # counts. Caching one allocation per exact shape retains all of those
+        # tensors and eventually consumes the activation headroom beside the
+        # preallocated KV pool. Keep only the largest storage per logical use and
+        # return a correctly shaped view for smaller iterations.
+        key = (name, reference.device, reference.dtype)
+        required_elements = math.prod(shape)
         buffer = self._inference_buffers.get(key)
-        if buffer is None:
-            buffer = torch.empty(shape, dtype=reference.dtype, device=reference.device)
+        if buffer is None or buffer.numel() < required_elements:
+            buffer = torch.empty(
+                required_elements,
+                dtype=reference.dtype,
+                device=reference.device,
+            )
             self._inference_buffers[key] = buffer
-        return buffer
+        return buffer[:required_elements].view(shape)
 
     def inference_index_tensor(self, name, offsets, device):
         """Reuse immutable scheduler offset patterns during inference."""
