@@ -16,6 +16,7 @@ from comparison_benchmark import (
     request_metrics,
     request_shapes,
     summarize_scenario,
+    warmup_pagedserve,
 )
 
 
@@ -24,6 +25,32 @@ class DummyTokenizer:
 
     def __len__(self):
         return 32
+
+
+def test_pagedserve_warmup_uses_requested_batch_shape():
+    class FakeScheduler:
+        def __init__(self):
+            self.added = []
+            self.finished = {}
+
+        def add_token_request(self, prompt, max_new_tokens):
+            request_id = len(self.added)
+            self.added.append((prompt, max_new_tokens))
+            return request_id
+
+        def step(self):
+            self.finished.update(
+                (request_id, object()) for request_id in range(len(self.added))
+            )
+
+    scheduler = FakeScheduler()
+    warmup_pagedserve(
+        scheduler,
+        [[1] * 4, [2] * 8, [3] * 16],
+        [4, 12, 20],
+        batch_size=2,
+    )
+    assert scheduler.added == [([1] * 4, 4), ([2] * 8, 8)]
 
 
 def test_gpt2_model_instantiation_bypasses_auto_model_lookup():

@@ -828,12 +828,18 @@ async def run_vllm_scenario(
     return records, duration, telemetry
 
 
-def warmup_pagedserve(scheduler, prompt, output_length):
-    request_id = scheduler.add_token_request(
-        prompt,
-        max_new_tokens=min(output_length, 8),
-    )
-    while request_id not in scheduler.finished:
+def warmup_pagedserve(scheduler, prompts, output_lengths, batch_size=1):
+    request_ids = [
+        scheduler.add_token_request(
+            prompt,
+            max_new_tokens=min(output_length, 8),
+        )
+        for prompt, output_length in zip(
+            prompts[:batch_size],
+            output_lengths[:batch_size],
+        )
+    ]
+    while any(request_id not in scheduler.finished for request_id in request_ids):
         scheduler.step()
     synchronize_cuda()
 
@@ -961,6 +967,12 @@ def parse_args():
     parser.add_argument("--max-model-len", type=positive_integer, default=1024)
     parser.add_argument("--max-batch-size", type=positive_integer, default=64)
     parser.add_argument(
+        "--warmup-batch-size",
+        type=positive_integer,
+        default=1,
+        help="PagedServe requests warmed together before measurement",
+    )
+    parser.add_argument(
         "--kv-cache-memory-mb",
         type=positive_integer,
         help="explicit PagedServe KV budget; omit for safe automatic CUDA sizing",
@@ -1023,6 +1035,8 @@ def validate_args(args):
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
     if not 0 < args.kv_cache_memory_utilization <= 1:
         raise ValueError("kv_cache_memory_utilization must be in (0, 1]")
+    if args.warmup_batch_size > args.max_batch_size:
+        raise ValueError("warmup_batch_size cannot exceed max_batch_size")
     if args.duration_seconds is not None:
         if args.duration_seconds <= 0:
             raise ValueError("duration_seconds must be positive")
@@ -1081,6 +1095,7 @@ def base_report(args, input_lengths, output_lengths):
             "seed": args.seed,
             "max_model_len": args.max_model_len,
             "max_batch_size": args.max_batch_size,
+            "warmup_batch_size": args.warmup_batch_size,
             "kv_cache_memory_mb": args.kv_cache_memory_mb,
             "kv_cache_memory_utilization": args.kv_cache_memory_utilization,
             "kv_cache_safety_mb": args.kv_cache_safety_mb,
@@ -1136,7 +1151,12 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
     report["gpu_lifecycle"]["after_engine_initialization"] = nvidia_smi_snapshot()
     scheduler.eos_token_id = None
     warmup_start = time.perf_counter()
-    warmup_pagedserve(scheduler, prompts[0], output_lengths[0])
+    warmup_pagedserve(
+        scheduler,
+        prompts,
+        output_lengths,
+        min(args.warmup_batch_size, len(prompts)),
+    )
     warmup_seconds = time.perf_counter() - warmup_start
     report["gpu_lifecycle"]["after_warmup"] = nvidia_smi_snapshot()
     report["engine_metadata"] = {

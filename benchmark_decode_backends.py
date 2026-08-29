@@ -28,6 +28,7 @@ def one_run(args, backend, batch_size, input_length, repetition, destination):
         "--num-requests", str(batch_size),
         "--request-rate", "inf",
         "--max-batch-size", str(batch_size),
+        "--warmup-batch-size", str(batch_size),
         "--pagedserve-strategy", "orca",
         "--decode-attention-backend", backend,
         "--kv-cache-dtype", args.kv_cache_dtype,
