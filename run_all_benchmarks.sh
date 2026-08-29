@@ -17,6 +17,7 @@ REPETITIONS=1
 REQUESTS_PER_REPLICA=120
 DURATION_SECONDS=""
 MAX_BATCH_SIZE=128
+KV_CACHE_SAFETY_MB=3072
 DECODE_ATTENTION_BACKEND="torch"
 TTFT_SLO_MS=""
 TPOT_SLO_MS=""
@@ -43,6 +44,8 @@ Options:
   --duration-seconds SECONDS    Generate arrivals for this duration per rate;
                                 overrides the request count in timed sweeps.
   --max-batch-size N            Maximum sequences per worker (default: 128).
+  --kv-cache-safety-mb N        VRAM retained outside PagedServe KV cache
+                                (default: 3072).
   --decode-attention-backend B  PagedServe decode backend: torch or triton.
   --short-rate RPS              Repeat to replace short-context rates.
   --long-rate RPS               Repeat to replace long-context rates.
@@ -111,6 +114,11 @@ while [[ $# -gt 0 ]]; do
     --max-batch-size)
       require_value "$@"
       MAX_BATCH_SIZE="$2"
+      shift 2
+      ;;
+    --kv-cache-safety-mb)
+      require_value "$@"
+      KV_CACHE_SAFETY_MB="$2"
       shift 2
       ;;
     --decode-attention-backend)
@@ -231,6 +239,10 @@ if [[ ! "$MAX_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
   echo "--max-batch-size must be a positive integer" >&2
   exit 2
 fi
+if [[ ! "$KV_CACHE_SAFETY_MB" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--kv-cache-safety-mb must be a positive integer" >&2
+  exit 2
+fi
 if [[ ! "$REPETITIONS" =~ ^[1-9][0-9]*$ ]]; then
   echo "--repetitions must be a positive integer" >&2
   exit 2
@@ -254,6 +266,7 @@ mkdir -p "$RESULT_ROOT"
   echo "requests_per_replica=$REQUESTS_PER_REPLICA"
   echo "duration_seconds=${DURATION_SECONDS:-request-count-driven}"
   echo "max_batch_size=$MAX_BATCH_SIZE"
+  echo "kv_cache_safety_mb=$KV_CACHE_SAFETY_MB"
   echo "decode_attention_backend=$DECODE_ATTENTION_BACKEND"
   echo "models=${MODELS[*]}"
   echo "engines=${ENGINES[*]}"
@@ -312,6 +325,7 @@ run_case() {
     --output-length "$output_length"
     --num-requests-per-replica "$REQUESTS_PER_REPLICA"
     --max-batch-size "$MAX_BATCH_SIZE"
+    --kv-cache-safety-mb "$KV_CACHE_SAFETY_MB"
     --seed "$((1234 + (trial - 1) * 10000))"
     --output-dir "$case_dir/raw"
   )
