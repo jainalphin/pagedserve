@@ -13,6 +13,7 @@ from comparison_benchmark import (
     consume_vllm_request,
     create_monitor,
     deterministic_prompts,
+    make_vllm_sampling_params,
     request_metrics,
     request_shapes,
     summarize_scenario,
@@ -166,6 +167,11 @@ def test_common_request_metrics_and_goodput():
     assert not summary["failed_requests"]
     assert math.isclose(summary["goodput_requests_per_second"], 1 / 1.1)
     assert summary["generated_tokens"] == 6
+    assert summary["all_generated_tokens_including_failed_requests"] == 6
+    assert summary["coalesced_token_callbacks"] == 0
+    assert summary["coalesced_generated_tokens"] == 0
+    assert summary["requests_with_coalesced_tokens"] == 0
+    assert summary["max_tokens_per_callback"] == 1
 
     no_slo_summary = summarize_scenario(
         engine="test",
@@ -217,9 +223,12 @@ def test_vllm_delta_stream_records_single_token_callbacks():
     assert record.error is None
     assert record.token_ids == [20, 21, 22]
     assert len(record.token_times) == 3
+    assert record.coalesced_token_callbacks == 0
+    assert record.coalesced_generated_tokens == 0
+    assert record.max_tokens_per_callback == 1
 
 
-def test_vllm_delta_stream_rejects_ambiguous_multi_token_callback():
+def test_vllm_delta_stream_records_coalesced_multi_token_callback():
     class FakeVLLMEngine:
         async def generate(self, **kwargs):
             yield SimpleNamespace(
@@ -236,9 +245,102 @@ def test_vllm_delta_stream_rejects_ambiguous_multi_token_callback():
             benchmark_start=time.perf_counter(),
         )
     )
-    assert "timestamps would be ambiguous" in record.error
-    assert not record.token_ids
-    assert not record.token_times
+    assert record.error is None
+    assert record.token_ids == [20, 21]
+    assert len(record.token_times) == 2
+    assert record.token_times[0] == record.token_times[1]
+    assert record.coalesced_token_callbacks == 1
+    assert record.coalesced_generated_tokens == 2
+    assert record.max_tokens_per_callback == 2
+
+
+def test_vllm_sampling_params_request_delta_stream_interval_one():
+    class FakeSamplingParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeRequestOutputKind:
+        DELTA = "delta"
+
+    params = make_vllm_sampling_params(
+        FakeSamplingParams,
+        FakeRequestOutputKind,
+        output_length=32,
+        output_kind=FakeRequestOutputKind.DELTA,
+        stream_interval=1,
+    )
+
+    assert params.kwargs == {
+        "temperature": 0.0,
+        "max_tokens": 32,
+        "ignore_eos": True,
+        "output_kind": "delta",
+        "detokenize": False,
+        "stream_interval": 1,
+    }
+
+
+def test_vllm_sampling_params_falls_back_for_legacy_vllm():
+    class LegacySamplingParams:
+        def __init__(self, temperature, max_tokens, ignore_eos, output_kind):
+            self.kwargs = {
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "ignore_eos": ignore_eos,
+                "output_kind": output_kind,
+            }
+
+    class FakeRequestOutputKind:
+        DELTA = "delta"
+
+    params = make_vllm_sampling_params(
+        LegacySamplingParams,
+        FakeRequestOutputKind,
+        output_length=32,
+        output_kind=FakeRequestOutputKind.DELTA,
+        stream_interval=1,
+    )
+
+    assert params.kwargs == {
+        "temperature": 0.0,
+        "max_tokens": 32,
+        "ignore_eos": True,
+        "output_kind": "delta",
+    }
+
+
+def test_summary_reports_coalesced_token_callbacks_without_failure():
+    records = [
+        RequestRecord(
+            request_index=0,
+            scheduled_arrival=0.0,
+            requested_output_length=3,
+            token_times=[0.1, 0.2, 0.2],
+            token_ids=[1, 2, 3],
+            coalesced_token_callbacks=1,
+            coalesced_generated_tokens=2,
+            max_tokens_per_callback=2,
+        )
+    ]
+    summary = summarize_scenario(
+        engine="test",
+        request_rate=1.0,
+        records=records,
+        duration=1.0,
+        output_length=3,
+        telemetry=None,
+        ttft_slo_ms=None,
+        tpot_slo_ms=None,
+        e2e_slo_ms=None,
+    )
+    assert summary["successful_requests"] == 1
+    assert summary["failed_requests"] == []
+    assert summary["generated_tokens"] == 3
+    assert summary["coalesced_token_callbacks"] == 1
+    assert summary["coalesced_generated_tokens"] == 2
+    assert summary["requests_with_coalesced_tokens"] == 1
+    assert summary["max_tokens_per_callback"] == 2
+    assert summary["raw_requests"][0]["coalesced_token_callbacks"] == 1
 
 
 def test_summary_reports_each_request_shape_separately():

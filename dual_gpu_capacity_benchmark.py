@@ -236,6 +236,29 @@ def combine_rate(worker_results, total_offered_rate):
     generated_tokens = sum(
         result["generated_tokens"] for result in worker_results
     )
+    all_generated_tokens = sum(
+        result.get(
+            "all_generated_tokens_including_failed_requests",
+            result["generated_tokens"],
+        )
+        for result in worker_results
+    )
+    coalesced_token_callbacks = sum(
+        result.get("coalesced_token_callbacks", 0)
+        for result in worker_results
+    )
+    coalesced_generated_tokens = sum(
+        result.get("coalesced_generated_tokens", 0)
+        for result in worker_results
+    )
+    requests_with_coalesced_tokens = sum(
+        result.get("requests_with_coalesced_tokens", 0)
+        for result in worker_results
+    )
+    max_tokens_per_callback = max(
+        (result.get("max_tokens_per_callback", 1) for result in worker_results),
+        default=1,
+    )
     slo_good_counts = [result.get("slo_good_requests") for result in worker_results]
     realized_rates = [
         result["realized_arrival_rate"]
@@ -302,6 +325,11 @@ def combine_rate(worker_results, total_offered_rate):
         ),
         "successful_requests": successful_requests,
         "generated_tokens": generated_tokens,
+        "all_generated_tokens_including_failed_requests": all_generated_tokens,
+        "coalesced_token_callbacks": coalesced_token_callbacks,
+        "coalesced_generated_tokens": coalesced_generated_tokens,
+        "requests_with_coalesced_tokens": requests_with_coalesced_tokens,
+        "max_tokens_per_callback": max_tokens_per_callback,
         "failed_requests": sum(
             len(result["failed_requests"]) for result in worker_results
         ),
@@ -438,6 +466,7 @@ def main():
         ),
         "gpu_ids": args.gpu,
         "model_metadata": model_metadata,
+        "comparison_contract": reports[0].get("comparison_contract"),
         "settings": {
             "dtype": args.dtype,
             "input_length": args.input_length,
@@ -551,6 +580,20 @@ def main():
             f"  delivered {result['offered_load_delivery_ratio'] * 100:.2f}% "
             f"of offered RPS | {load_label}"
         )
+        if result.get("coalesced_token_callbacks", 0):
+            print(
+                "  stream coalescing: "
+                f"{result['coalesced_token_callbacks']} multi-token callbacks | "
+                f"{result['coalesced_generated_tokens']} tokens in coalesced "
+                f"callbacks | {result['requests_with_coalesced_tokens']} "
+                f"requests affected | max "
+                f"{result['max_tokens_per_callback']} tokens/callback"
+            )
+            print(
+                "  latency note: TTFT/E2E use observed callback delivery times; "
+                "TPOT/ITL include zero-length gaps for tokens delivered together "
+                "in one callback."
+            )
         for shape in result["latency_by_request_shape"]:
             print(
                 f"  shape {shape['input_tokens']}+{shape['output_tokens']} "

@@ -9,6 +9,7 @@ vLLM use their native continuous-batching schedulers.
 import argparse
 import asyncio
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -47,6 +48,9 @@ class RequestRecord:
     submitted_at: float | None = None
     token_times: list[float] = field(default_factory=list)
     token_ids: list[int] = field(default_factory=list)
+    coalesced_token_callbacks: int = 0
+    coalesced_generated_tokens: int = 0
+    max_tokens_per_callback: int = 1
     error: str | None = None
 
 
@@ -549,6 +553,19 @@ def summarize_scenario(
     )
     generated_tokens = sum(len(record.token_times) for record, _ in completed)
     all_generated_tokens = sum(len(record.token_times) for record in records)
+    coalesced_token_callbacks = sum(
+        record.coalesced_token_callbacks for record in records
+    )
+    coalesced_generated_tokens = sum(
+        record.coalesced_generated_tokens for record in records
+    )
+    requests_with_coalesced_tokens = sum(
+        record.coalesced_token_callbacks > 0 for record in records
+    )
+    max_tokens_per_callback = max(
+        (record.max_tokens_per_callback for record in records),
+        default=1,
+    )
     scheduled_arrivals = sorted(record.scheduled_arrival for record in records)
     arrival_intervals = [
         current - previous
@@ -616,6 +633,9 @@ def summarize_scenario(
                 "requested_output_tokens": record.requested_output_length,
                 "generated_tokens": len(record.token_times),
                 "output_token_ids": record.token_ids,
+                "coalesced_token_callbacks": record.coalesced_token_callbacks,
+                "coalesced_generated_tokens": record.coalesced_generated_tokens,
+                "max_tokens_per_callback": record.max_tokens_per_callback,
                 "ttft_seconds": metrics["ttft"] if metrics else None,
                 "queue_delay_seconds": (
                     metrics["queue_delay"] if metrics else None
@@ -657,6 +677,10 @@ def summarize_scenario(
         "output_token_throughput": generated_tokens / duration,
         "generated_tokens": generated_tokens,
         "all_generated_tokens_including_failed_requests": all_generated_tokens,
+        "coalesced_token_callbacks": coalesced_token_callbacks,
+        "coalesced_generated_tokens": coalesced_generated_tokens,
+        "requests_with_coalesced_tokens": requests_with_coalesced_tokens,
+        "max_tokens_per_callback": max_tokens_per_callback,
         "ttft_seconds": summarize(ttfts),
         "queue_delay_seconds": summarize(queue_delays),
         "engine_ttft_seconds": summarize(engine_ttfts),
@@ -820,19 +844,66 @@ async def consume_vllm_request(
                 continue
             new_token_ids = output.outputs[0].token_ids
             if new_token_ids:
-                if len(new_token_ids) != 1:
-                    record.error = (
-                        "vLLM returned multiple tokens in one DELTA callback; "
-                        "per-token timestamps would be ambiguous. Disable output "
-                        "coalescing or speculative/multi-step decoding for this "
-                        "latency benchmark."
-                    )
-                    return
                 token_time = time.perf_counter() - benchmark_start
-                record.token_times.append(token_time)
-                record.token_ids.append(int(new_token_ids[0]))
+                token_count = len(new_token_ids)
+                if token_count > 1:
+                    record.coalesced_token_callbacks += 1
+                    record.coalesced_generated_tokens += token_count
+                    record.max_tokens_per_callback = max(
+                        record.max_tokens_per_callback,
+                        token_count,
+                    )
+                record.token_times.extend([token_time] * token_count)
+                record.token_ids.extend(int(token_id) for token_id in new_token_ids)
     except Exception as error:
         record.error = f"{type(error).__name__}: {error}"
+
+
+def supports_keyword(callable_object, keyword):
+    try:
+        parameters = inspect.signature(callable_object).parameters
+    except (TypeError, ValueError):
+        return True
+    return (
+        keyword in parameters
+        or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
+
+
+def make_vllm_sampling_params(
+    SamplingParams,
+    RequestOutputKind,
+    output_length,
+    output_kind,
+    *,
+    stream_interval=1,
+):
+    kwargs = {
+        "temperature": 0.0,
+        "max_tokens": output_length,
+        "ignore_eos": True,
+        "output_kind": output_kind,
+    }
+    if supports_keyword(SamplingParams, "detokenize"):
+        kwargs["detokenize"] = False
+    if stream_interval is not None and supports_keyword(
+        SamplingParams,
+        "stream_interval",
+    ):
+        kwargs["stream_interval"] = stream_interval
+    while True:
+        try:
+            return SamplingParams(**kwargs)
+        except TypeError as error:
+            for key in ("stream_interval", "detokenize"):
+                if key in kwargs and key in str(error):
+                    kwargs.pop(key, None)
+                    break
+            else:
+                raise
 
 
 async def run_vllm_scenario(
@@ -871,11 +942,12 @@ async def run_vllm_scenario(
         *[
             consume_vllm_request(
                 engine,
-                SamplingParams(
-                    temperature=0.0,
-                    max_tokens=output_length,
-                    ignore_eos=True,
-                    output_kind=RequestOutputKind.DELTA,
+                make_vllm_sampling_params(
+                    SamplingParams,
+                    RequestOutputKind,
+                    output_length,
+                    RequestOutputKind.DELTA,
+                    stream_interval=1,
                 ),
                 prompt,
                 record,
@@ -921,11 +993,12 @@ async def warmup_vllm(engine, prompt, output_length):
     from vllm import SamplingParams
     from vllm.sampling_params import RequestOutputKind
 
-    params = SamplingParams(
-        temperature=0.0,
-        max_tokens=min(output_length, 8),
-        ignore_eos=True,
-        output_kind=RequestOutputKind.FINAL_ONLY,
+    params = make_vllm_sampling_params(
+        SamplingParams,
+        RequestOutputKind,
+        min(output_length, 8),
+        RequestOutputKind.FINAL_ONLY,
+        stream_interval=1,
     )
     async for _ in engine.generate(
         request_id="benchmark-warmup",
@@ -1136,6 +1209,28 @@ def base_report(args, input_lengths, output_lengths):
         "gpu_lifecycle": {
             "before_engine_initialization": nvidia_smi_snapshot(),
         },
+        "comparison_contract": {
+            "scope": (
+                "same workload and comparable public resource limits; each engine "
+                "keeps its native scheduler and optimized execution path"
+            ),
+            "same_model_id": args.model_id,
+            "same_tokenizer_generated_prompts": True,
+            "prompt_token_ids_are_deterministic_from_seed": True,
+            "same_open_loop_arrival_trace_for_same_seed_rate_and_pattern": True,
+            "same_input_output_length_distribution": True,
+            "same_dtype": args.dtype,
+            "same_max_sequence_concurrency": args.max_batch_size,
+            "same_total_device_memory_utilization_target": (
+                memory_budget_comparable
+            ),
+            "decode_policy": "greedy",
+            "fixed_output_length_policy": "ignore_eos_until_requested_max_tokens",
+            "measured_output_form": "token_ids_without_text_detokenization",
+            "vllm_prefix_caching": "disabled",
+            "vllm_streaming_mode": "DELTA",
+            "vllm_stream_interval_requested": 1,
+        },
         "settings": {
             "engine": args.engine,
             "model_id": args.model_id,
@@ -1256,6 +1351,16 @@ def run_pagedserve(args, tokenizer, prompts, output_lengths, report):
     report["gpu_lifecycle"]["after_warmup"] = nvidia_smi_snapshot()
     report["engine_metadata"] = {
         "policy": "continuous_batching",
+        "model_id": args.model_id,
+        "dtype": args.dtype,
+        "max_model_len": args.max_model_len,
+        "max_batch_size": args.max_batch_size,
+        "kv_cache_memory_utilization": (
+            args.kv_cache_memory_utilization
+            if args.kv_cache_memory_utilization is not None
+            else args.gpu_memory_utilization
+        ),
+        "fixed_output_length_policy": "eos_disabled",
         "decode_attention_backend": args.decode_attention_backend,
         "kv_cache_dtype": args.kv_cache_dtype,
         "model_dtype": str(next(scheduler.model_engine.parameters()).dtype),
@@ -1338,9 +1443,12 @@ def run_hf(args, tokenizer, model_config, prompts, output_lengths, report):
 
 async def run_vllm(args, prompts, output_lengths, report):
     import vllm
+    from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
 
+    stream_interval_supported = supports_keyword(SamplingParams, "stream_interval")
+    detokenize_supported = supports_keyword(SamplingParams, "detokenize")
     initialization_start = time.perf_counter()
     engine_args = AsyncEngineArgs(
         model=args.model_id,
@@ -1362,6 +1470,23 @@ async def run_vllm(args, prompts, output_lengths, report):
         "policy": "vllm_async_continuous_batching",
         "vllm_version": vllm.__version__,
         "initialization_seconds": initialization_seconds,
+        "model_id": args.model_id,
+        "dtype": args.dtype,
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_batch_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "prefix_caching_enabled": False,
+        "log_stats_enabled": False,
+        "enforce_eager": args.vllm_enforce_eager,
+        "sampling_policy": {
+            "temperature": 0.0,
+            "ignore_eos": True,
+            "output_kind": "DELTA",
+            "stream_interval_requested": 1,
+            "stream_interval_supported": stream_interval_supported,
+            "detokenize_requested": False,
+            "detokenize_supported": detokenize_supported,
+        },
         "vllm_cache_config": {
             "block_size_tokens": getattr(cache_config, "block_size", None),
             "kv_cache_memory_bytes": getattr(
@@ -1498,6 +1623,20 @@ def print_report(report):
             print(
                 f"  delivered {result['offered_load_delivery_ratio'] * 100:.2f}% "
                 f"of offered RPS | {load_label}"
+            )
+        if result.get("coalesced_token_callbacks", 0):
+            print(
+                "  stream coalescing: "
+                f"{result['coalesced_token_callbacks']} multi-token callbacks | "
+                f"{result['coalesced_generated_tokens']} tokens in coalesced "
+                f"callbacks | {result['requests_with_coalesced_tokens']} "
+                f"requests affected | max "
+                f"{result['max_tokens_per_callback']} tokens/callback"
+            )
+            print(
+                "  latency note: TTFT/E2E use observed callback delivery times; "
+                "TPOT/ITL include zero-length gaps for tokens delivered together "
+                "in one callback."
             )
         for shape in result["latency_by_request_shape"]:
             print(

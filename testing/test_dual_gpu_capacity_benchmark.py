@@ -26,6 +26,11 @@ def worker_result(duration, request_count, token_count, shape=(128, 2)):
         "successful_requests": request_count,
         "slo_good_requests": request_count,
         "generated_tokens": token_count,
+        "all_generated_tokens_including_failed_requests": token_count,
+        "coalesced_token_callbacks": 0,
+        "coalesced_generated_tokens": 0,
+        "requests_with_coalesced_tokens": 0,
+        "max_tokens_per_callback": 1,
         "achieved_request_throughput": request_count / duration,
         "output_token_throughput": token_count / duration,
         "failed_requests": [],
@@ -65,6 +70,26 @@ def test_combined_results_keep_request_shapes_separate():
     ] == [(128, 2), (900, 3)]
 
 
+def test_combined_results_sum_stream_coalescing_metrics():
+    first = worker_result(duration=10.0, request_count=1, token_count=2)
+    second = worker_result(duration=10.0, request_count=1, token_count=2)
+    first["coalesced_token_callbacks"] = 2
+    first["coalesced_generated_tokens"] = 5
+    first["requests_with_coalesced_tokens"] = 1
+    first["max_tokens_per_callback"] = 3
+    second["coalesced_token_callbacks"] = 4
+    second["coalesced_generated_tokens"] = 9
+    second["requests_with_coalesced_tokens"] = 2
+    second["max_tokens_per_callback"] = 4
+
+    combined = combine_rate([first, second], total_offered_rate=1.0)
+
+    assert combined["coalesced_token_callbacks"] == 6
+    assert combined["coalesced_generated_tokens"] == 14
+    assert combined["requests_with_coalesced_tokens"] == 3
+    assert combined["max_tokens_per_callback"] == 4
+
+
 def test_worker_uses_one_shared_memory_target_and_full_batch_warmup():
     args = SimpleNamespace(
         gpu=["0", "1"],
@@ -96,4 +121,3 @@ def test_worker_uses_one_shared_memory_target_and_full_batch_warmup():
     warmup_index = command.index("--warmup-batch-size")
     assert command[utilization_index + 1] == "0.8"
     assert command[warmup_index + 1] == "64"
-
