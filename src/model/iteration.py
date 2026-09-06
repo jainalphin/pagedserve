@@ -15,6 +15,7 @@ class IterationItem:
     position_ids: Tuple[int, ...]
     start_offset: int
     end_offset: int
+    produces_output: bool = True
 
     def __post_init__(self):
         # Describes one request participating in the current Orca iteration
@@ -30,6 +31,8 @@ class IterationItem:
             raise ValueError("Offsets do not match the number of item tokens")
         if self.phase == "decode" and len(self.token_ids) != 1:
             raise ValueError("A decode item must contain exactly one token")
+        if self.phase == "decode" and not self.produces_output:
+            raise ValueError("A decode item must produce output logits")
 
     @property
     def token_count(self):

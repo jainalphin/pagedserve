@@ -1,5 +1,6 @@
 import math
 
+import pytest
 import torch
 
 from src.model.kv_manager import KVCacheManager
@@ -9,7 +10,10 @@ from src.model.paged_decoder import (
     PagedDecoderLM,
     TransformerConfig,
 )
-from src.scheduler.orca_scheduler import ContinuousBatchScheduler
+from src.scheduler.orca_scheduler import (
+    SARATHI_STRATEGY,
+    ContinuousBatchScheduler,
+)
 
 
 def test_store_prefill():
@@ -306,6 +310,157 @@ def test_paged_attention_matches_contiguous_attention():
 
     manager.commit_token(request_id)
     assert manager.requests[request_id].sequence_length == 5
+
+
+def test_batched_decode_attention_matches_scalar_with_variable_contexts():
+    torch.manual_seed(43)
+    num_heads = 2
+    head_dim = 4
+    manager = KVCacheManager(
+        block_size=2,
+        total_memory=16 * 1024,
+        tensor_dtype=torch.float32,
+        device="cpu",
+        num_layers=1,
+        num_kv_heads=num_heads,
+        head_dim=head_dim,
+    )
+    attention = PagedAttention(manager)
+    request_ids = ["short", "medium", "long"]
+    context_lengths = [1, 3, 5]
+    queries = torch.randn(len(request_ids), num_heads, head_dim)
+
+    for request_id, context_length in zip(request_ids, context_lengths):
+        prompt_length = context_length - 1
+        if prompt_length:
+            manager.store_prefill_request(
+                request_id,
+                [
+                    (
+                        torch.randn(num_heads, prompt_length, head_dim),
+                        torch.randn(num_heads, prompt_length, head_dim),
+                    )
+                ],
+            )
+        manager.reserve_token_slot(request_id)
+        manager.write_layer_kv(
+            request_id,
+            0,
+            torch.randn(num_heads, head_dim),
+            torch.randn(num_heads, head_dim),
+        )
+
+    expected = torch.stack(
+        [
+            attention.forward(request_id, 0, query)
+            for request_id, query in zip(request_ids, queries)
+        ]
+    )
+    actual = attention.forward_batch(request_ids, 0, queries)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_triton_paged_decode_matches_torch_across_kv_blocks():
+    pytest.importorskip("triton")
+    torch.manual_seed(45)
+    device = torch.device("cuda")
+    num_heads = 2
+    head_dim = 64
+    num_layers = 12
+    manager = KVCacheManager(
+        block_size=16,
+        total_memory=4 * 1024 * 1024,
+        tensor_dtype=torch.float32,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_heads,
+        head_dim=head_dim,
+    )
+    request_ids = ["one-token", "partial-block", "three-blocks"]
+    context_lengths = [1, 19, 35]
+    queries = torch.randn(
+        len(request_ids),
+        num_heads,
+        head_dim,
+        device=device,
+    )
+
+    for request_id, context_length in zip(request_ids, context_lengths):
+        prompt_length = context_length - 1
+        if prompt_length:
+            layer_cache = [
+                (
+                    torch.randn(
+                        num_heads, prompt_length, head_dim, device=device
+                    ),
+                    torch.randn(
+                        num_heads, prompt_length, head_dim, device=device
+                    ),
+                )
+                for _ in range(num_layers)
+            ]
+            manager.store_prefill_request(
+                request_id,
+                layer_cache,
+            )
+        manager.reserve_token_slot(request_id)
+        for layer_id in range(num_layers):
+            manager.write_layer_kv(
+                request_id,
+                layer_id,
+                torch.randn(num_heads, head_dim, device=device),
+                torch.randn(num_heads, head_dim, device=device),
+            )
+
+    for tested_layer in (0, num_layers - 1):
+        expected = PagedAttention(
+            manager,
+            decode_attention_backend="torch",
+        ).forward_batch(
+            request_ids,
+            tested_layer,
+            queries,
+        )
+        actual = PagedAttention(
+            manager,
+            decode_attention_backend="triton",
+        ).forward_batch(
+            request_ids,
+            tested_layer,
+            queries,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+def test_batched_fresh_prefill_matches_individual_causal_attention():
+    torch.manual_seed(44)
+    batch_size = 3
+    token_count = 5
+    num_heads = 2
+    head_dim = 4
+    manager = KVCacheManager(
+        block_size=2,
+        total_memory=16 * 1024,
+        tensor_dtype=torch.float32,
+        device="cpu",
+        num_layers=1,
+        num_kv_heads=num_heads,
+        head_dim=head_dim,
+    )
+    attention = PagedAttention(manager)
+    queries = torch.randn(batch_size, token_count, num_heads, head_dim)
+    keys = torch.randn_like(queries)
+    values = torch.randn_like(queries)
+
+    expected = torch.stack(
+        [
+            attention.causal_prefill(query, key, value)
+            for query, key, value in zip(queries, keys, values)
+        ]
+    )
+    actual = attention.causal_prefill_batch(queries, keys, values)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
 
 
 def test_prefill():
@@ -701,6 +856,77 @@ def test_flattened_prefill_matches_dense_prefill():
         torch.testing.assert_close(stored_values, expected_values)
 
 
+def test_chunked_prefill_matches_dense_prefill():
+    torch.manual_seed(10)
+    config = TransformerConfig(
+        vocab_size=100,
+        hidden_size=64,
+        num_layers=2,
+        num_heads=4,
+        head_dim=16,
+        mlp_hidden_size=256,
+        max_sequence_length=32,
+    )
+    model = PagedDecoderLM(config).eval()
+    manager = KVCacheManager(
+        block_size=4,
+        total_memory=1024 * 1024,
+        tensor_dtype=next(model.parameters()).dtype,
+        device="cpu",
+        num_layers=config.num_layers,
+        num_kv_heads=config.num_heads,
+        head_dim=config.head_dim,
+    )
+    paged_attention = PagedAttention(manager)
+    prompt = torch.tensor([[12, 34, 56, 78, 21]], dtype=torch.long)
+
+    with torch.inference_mode():
+        dense_logits, dense_cache = model.prefill(prompt)
+
+    chunk_logits = None
+    for start, end in ((0, 2), (2, 4), (4, 5)):
+        chunk = IterationBatch(
+            items=(
+                IterationItem(
+                    request_id="chunked",
+                    phase="prefill",
+                    token_ids=tuple(prompt[0, start:end].tolist()),
+                    position_ids=tuple(range(start, end)),
+                    start_offset=0,
+                    end_offset=end - start,
+                    produces_output=end == prompt.shape[1],
+                ),
+            ),
+            input_ids=prompt[0, start:end],
+            position_ids=torch.arange(start, end, dtype=torch.long),
+        )
+        with torch.inference_mode():
+            chunk_logits = model.forward_iteration(
+                chunk,
+                manager,
+                paged_attention,
+            )
+        assert manager.requests["chunked"].sequence_length == end
+        expected_logit_rows = 1 if end == prompt.shape[1] else 0
+        assert chunk_logits.shape == (expected_logit_rows, config.vocab_size)
+
+    torch.testing.assert_close(
+        chunk_logits[0],
+        dense_logits[0, -1],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    for layer_id, (expected_keys, expected_values) in enumerate(dense_cache):
+        stored_keys, stored_values = manager.gather_layer("chunked", layer_id)
+        torch.testing.assert_close(stored_keys, expected_keys, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            stored_values,
+            expected_values,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
 class IntegerTokenizer:
     eos_token_id = None
 
@@ -759,4 +985,67 @@ def test_orca_scheduler_batches_different_prompt_lengths():
     assert set(scheduler.finished) == {request_a, request_b}
     assert request_a not in manager.requests
     assert request_b not in manager.requests
+    assert scheduler.reserved_blocks == 0
+
+
+def test_sarathi_scheduler_chunks_prefill_and_prioritizes_decodes():
+    torch.manual_seed(12)
+    config = TransformerConfig(
+        vocab_size=100,
+        hidden_size=64,
+        num_layers=2,
+        num_heads=4,
+        head_dim=16,
+        mlp_hidden_size=256,
+        max_sequence_length=32,
+    )
+    model = PagedDecoderLM(config).eval()
+    manager = KVCacheManager(
+        block_size=4,
+        total_memory=1024 * 1024,
+        tensor_dtype=next(model.parameters()).dtype,
+        device="cpu",
+        num_layers=config.num_layers,
+        num_kv_heads=config.num_heads,
+        head_dim=config.head_dim,
+    )
+    scheduler = ContinuousBatchScheduler(
+        model_engine=model,
+        max_batch_size=2,
+        tokenizer=IntegerTokenizer(),
+        kv_manager=manager,
+        paged_attn_manager=PagedAttention(manager),
+        scheduling_strategy=SARATHI_STRATEGY,
+        prefill_chunk_size=2,
+    )
+
+    request_a = scheduler.add_request("10 20 30 40 50", max_new_tokens=2)
+    assert scheduler.step() == {}
+    assert scheduler.waiting[0].prefill_cursor == 2
+    assert manager.requests[request_a].sequence_length == 2
+
+    assert scheduler.step() == {}
+    assert scheduler.waiting[0].prefill_cursor == 4
+    assert manager.requests[request_a].sequence_length == 4
+
+    first_tokens = scheduler.step()
+    assert set(first_tokens) == {request_a}
+    assert request_a in scheduler.active
+    assert not scheduler.waiting
+
+    request_b = scheduler.add_request("60 70 80 90", max_new_tokens=2)
+    mixed_tokens = scheduler.step()
+    assert set(mixed_tokens) == {request_a}
+    assert request_a in scheduler.finished
+    assert scheduler.waiting[0].request_id == request_b
+    assert scheduler.waiting[0].prefill_cursor == 2
+    assert manager.requests[request_b].sequence_length == 2
+
+    final_prefill_tokens = scheduler.step()
+    assert set(final_prefill_tokens) == {request_b}
+    assert request_b in scheduler.active
+    assert not scheduler.waiting
+
+    scheduler.run_until_complete()
+    assert set(scheduler.finished) == {request_a, request_b}
     assert scheduler.reserved_blocks == 0

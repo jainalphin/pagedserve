@@ -12,6 +12,20 @@ from src.model.kv_manager import KVCacheManager
 from src.model.paged_attention import PagedAttention
 
 
+CUDA_GRAPH_BATCH_SIZES = (1, 8, 16, 32)
+
+
+class DecodeCUDAGraph:
+    """Long-lived static tensors and replay object for one decode shape bucket."""
+
+    def __init__(self, graph, hidden_states, logits, decode_metadata):
+        self.graph = graph
+        self.hidden_states = hidden_states
+        self.logits = logits
+        self.decode_metadata = decode_metadata
+        self.replays = 0
+
+
 @dataclass
 class TransformerConfig:
     vocab_size: int = field(default=1000)
@@ -21,15 +35,22 @@ class TransformerConfig:
     head_dim: int = field(default=16)
     mlp_hidden_size: int = field(default=256)
     max_sequence_length: int = field(default=128)
+    activation_function: str = field(default="gelu")
+    layer_norm_epsilon: float = field(default=1e-5)
+    tie_word_embeddings: bool = field(default=False)
+    lm_head_bias: bool = field(default=True)
 
 class PagedSelfAttention(nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
-        self.query_linear = nn.Linear(config.hidden_size, config.hidden_size)
-        self.key_linear = nn.Linear(config.hidden_size, config.hidden_size)
-        self.value_linear = nn.Linear(config.hidden_size, config.hidden_size)
+        # GPT-2 stores Q/K/V as one Conv1D projection. Keeping the same packed
+        # layout performs one GEMM and one weight read instead of three.
+        self.qkv_linear = nn.Linear(config.hidden_size, 3 * config.hidden_size)
         self.output_linear = nn.Linear(config.hidden_size, config.hidden_size)
+
+    def project_qkv(self, hidden_states):
+        return self.qkv_linear(hidden_states).split(self.config.hidden_size, dim=-1)
 
     def split_heads(self, input_data):
         batch_size, sequence_length, hidden_size = input_data.shape
@@ -53,9 +74,7 @@ class PagedSelfAttention(nn.Module):
 
     def prefill(self, hidden_states):
         # hidden_state:  [batch, sequence_length, hidden_size]
-        q = self.query_linear(hidden_states)  # [batch, sequence_length, hidden_size]
-        k = self.key_linear(hidden_states)
-        v = self.value_linear(hidden_states)
+        q, k, v = self.project_qkv(hidden_states)
 
         q = self.split_heads(q) # [B, heads, T, head_dim]
         k = self.split_heads(k)
@@ -76,29 +95,34 @@ class PagedSelfAttention(nn.Module):
 
         return attn_output, k, v
 
-    def decode(self, hidden_states, request_ids, layer_id, kv_manger: KVCacheManager, paged_attn_manager: PagedAttention):
+    def decode(self, hidden_states, request_ids, layer_id, kv_manger: KVCacheManager, paged_attn_manager: PagedAttention, decode_metadata):
         batch_size = len(request_ids)
         assert hidden_states.shape == (batch_size, 1, self.config.hidden_size)
 
-        q = self.query_linear(hidden_states)  # [batch, sequence_length, hidden_size]
-        k = self.key_linear(hidden_states)
-        v = self.value_linear(hidden_states)
+        q, k, v = self.project_qkv(hidden_states)
 
         q = self.split_heads(q).squeeze(2) # [B, heads, 1, head_dim]
         k = self.split_heads(k).squeeze(2)
         v = self.split_heads(v).squeeze(2)
 
-        kv_manger.write_layer_kv_batch(request_ids, layer_id, k, v)
-        output = paged_attn_manager.forward_batch(request_ids, layer_id, q) # [B, heads, head_dim]  - attention is sequential per request internally
+        output = paged_attn_manager.forward_batch(
+            request_ids,
+            layer_id,
+            q,
+            decode_metadata=decode_metadata,
+            new_keys=k,
+            new_values=v,
+        )
         output = output.unsqueeze(2) # [B, heads, 1, head_dim]
         output = self.merge_heads(output)
         output = self.output_linear(output)
         return output
 
-    def forward_iteration(self, hidden_states, items, layer_id, paged_attn_manager: PagedAttention,):
-        queries = self.split_heads_flat(self.query_linear(hidden_states))
-        keys = self.split_heads_flat(self.key_linear(hidden_states))
-        values = self.split_heads_flat(self.value_linear(hidden_states))
+    def forward_iteration(self, hidden_states, items, layer_id, paged_attn_manager: PagedAttention, decode_metadata=None):
+        queries, keys, values = self.project_qkv(hidden_states)
+        queries = self.split_heads_flat(queries)
+        keys = self.split_heads_flat(keys)
+        values = self.split_heads_flat(values)
 
         context, prefill_kv = paged_attn_manager.forward_iteration(
             items=items,
@@ -106,9 +130,34 @@ class PagedSelfAttention(nn.Module):
             queries=queries,
             keys=keys,
             values=values,
+            decode_metadata=decode_metadata,
         )
         output = self.output_linear(self.merge_heads_flat(context))
         return output, prefill_kv
+
+    def forward_decode_tensors(
+        self,
+        hidden_states,
+        request_ids,
+        layer_id,
+        paged_attn_manager: PagedAttention,
+        decode_metadata,
+    ):
+        """Decode-only path without per-layer IterationItem traversal."""
+        queries, keys, values = self.project_qkv(hidden_states)
+        queries = self.split_heads_flat(queries)
+        keys = self.split_heads_flat(keys)
+        values = self.split_heads_flat(values)
+        context = paged_attn_manager.forward_batch(
+            request_ids,
+            layer_id,
+            queries,
+            decode_metadata=decode_metadata,
+            new_keys=keys,
+            new_values=values,
+            _trusted_decode_metadata=True,
+        )
+        return self.output_linear(self.merge_heads_flat(context))
 
 
 
@@ -118,8 +167,14 @@ class DecoderBlock(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.self_attn = PagedSelfAttention(self.config)
-        self.input_layernorm = nn.LayerNorm(config.hidden_size)
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size)
+        self.input_layernorm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_epsilon,
+        )
+        self.post_attention_layernorm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_epsilon,
+        )
         self.mlp_up_proj = nn.Linear(config.hidden_size, config.mlp_hidden_size)
         self.mlp_down_proj = nn.Linear(config.mlp_hidden_size, config.hidden_size)
 
@@ -129,58 +184,129 @@ class DecoderBlock(nn.Module):
         hidden_states = attn_output + attention_residual
         mlp_residual = hidden_states
         hidden_states = self.mlp_up_proj(self.post_attention_layernorm(hidden_states))
-        hidden_states = F.gelu(hidden_states)
+        hidden_states = self._activate(hidden_states)
         hidden_states = self.mlp_down_proj(hidden_states) + mlp_residual
         return hidden_states, key_states, value_states
 
-    def decode(self, hidden_states, request_ids, kv_manger: KVCacheManager, paged_attn_manager: PagedAttention):
+    def decode(self, hidden_states, request_ids, kv_manger: KVCacheManager, paged_attn_manager: PagedAttention, decode_metadata):
         attention_residual = hidden_states
-        hidden_states = self.self_attn.decode(self.input_layernorm(hidden_states),
+        attention_output = self.self_attn.decode(self.input_layernorm(hidden_states),
                                                                   request_ids,
                                                                   self.layer_id,
                                                                   kv_manger,
-                                                                  paged_attn_manager)
-
-        hidden_states = hidden_states + attention_residual
+                                                                  paged_attn_manager,
+                                                                  decode_metadata)
+        hidden_states, normalized_hidden_states = self._residual_and_norm(
+            attention_residual,
+            attention_output,
+            paged_attn_manager,
+        )
         mlp_residual = hidden_states
-        hidden_states = self.mlp_up_proj(self.post_attention_layernorm(hidden_states))
-        hidden_states = F.gelu(hidden_states)
+        hidden_states = self.mlp_up_proj(normalized_hidden_states)
+        hidden_states = self._activate(hidden_states)
         hidden_states = self.mlp_down_proj(hidden_states) + mlp_residual
         return hidden_states
 
-    def forward_iteration(self, hidden_states, items, paged_attn_manager: PagedAttention):
+    def forward_iteration(self, hidden_states, items, paged_attn_manager: PagedAttention, decode_metadata=None):
         attention_residual = hidden_states
         attention_output, prefill_kv = self.self_attn.forward_iteration(
             self.input_layernorm(hidden_states),
             items,
             self.layer_id,
             paged_attn_manager,
+            decode_metadata,
         )
-        hidden_states = attention_output + attention_residual
-
+        hidden_states, normalized_hidden_states = self._residual_and_norm(
+            attention_residual,
+            attention_output,
+            paged_attn_manager,
+        )
         mlp_residual = hidden_states
-        hidden_states = self.mlp_up_proj(self.post_attention_layernorm(hidden_states))
-        hidden_states = F.gelu(hidden_states)
+        hidden_states = self.mlp_up_proj(normalized_hidden_states)
+        hidden_states = self._activate(hidden_states)
         hidden_states = self.mlp_down_proj(hidden_states) + mlp_residual
         return hidden_states, prefill_kv
+
+    def forward_decode_tensors(
+        self,
+        hidden_states,
+        request_ids,
+        paged_attn_manager: PagedAttention,
+        decode_metadata,
+    ):
+        attention_residual = hidden_states
+        attention_output = self.self_attn.forward_decode_tensors(
+            self.input_layernorm(hidden_states),
+            request_ids,
+            self.layer_id,
+            paged_attn_manager,
+            decode_metadata,
+        )
+        hidden_states, normalized_hidden_states = self._residual_and_norm(
+            attention_residual,
+            attention_output,
+            paged_attn_manager,
+        )
+        mlp_output = self.mlp_up_proj(normalized_hidden_states)
+        mlp_output = self._activate(mlp_output)
+        return self.mlp_down_proj(mlp_output) + hidden_states
+
+    def _residual_and_norm(self, residual, update, paged_attn_manager):
+        if (
+            paged_attn_manager.decode_attention_backend == "triton"
+            and residual.is_cuda
+        ):
+            from src.kernels.triton_residual_layernorm import (
+                fused_residual_layer_norm,
+            )
+
+            return fused_residual_layer_norm(
+                residual,
+                update,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.bias,
+                self.post_attention_layernorm.eps,
+            )
+        hidden_states = residual + update
+        return hidden_states, self.post_attention_layernorm(hidden_states)
+
+    def _activate(self, hidden_states):
+        if self.config.activation_function == "gelu":
+            return F.gelu(hidden_states)
+        if self.config.activation_function == "gelu_tanh":
+            return F.gelu(hidden_states, approximate="tanh")
+        raise ValueError(
+            f"Unsupported activation function: {self.config.activation_function}"
+        )
 
 
 
 class PagedDecoderLM(nn.Module):
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, enable_cuda_graphs=True):
         super().__init__()
         self.config = config
         self.embedding_table = nn.Embedding(config.vocab_size, config.hidden_size)
         self.position_embeddings = nn.Embedding(config.max_sequence_length, config.hidden_size)
         self.layers = nn.ModuleList([DecoderBlock(config, layer_id=layer_id) for layer_id in range(config.num_layers)])
-        self.final_layernorm = nn.LayerNorm(config.hidden_size)
-        self.output_layer = nn.Linear(config.hidden_size, config.vocab_size)
+        self.final_layernorm = nn.LayerNorm(
+            config.hidden_size,
+            eps=config.layer_norm_epsilon,
+        )
+        self.output_layer = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=config.lm_head_bias,
+        )
+        if config.tie_word_embeddings:
+            self.output_layer.weight = self.embedding_table.weight
+        self.enable_cuda_graphs = enable_cuda_graphs
+        self._decode_cuda_graphs = {}
+        self._decode_cuda_graph_failures = {}
 
     def embedding_helper(self, input_ids, position_ids):
         assert input_ids.size() == position_ids.size()
-        assert (position_ids >= 0).all().item()
-        if (position_ids >= self.config.max_sequence_length).any().item():
-            raise ValueError("Position ID exceeds maximum sequence length")
+        if position_ids.dtype != torch.long:
+            raise ValueError("Position IDs must use torch.long")
 
         token_embeddings = self.embedding_table(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
@@ -211,11 +337,27 @@ class PagedDecoderLM(nn.Module):
             reserved_position, _, _ = kv_manager.reserve_token_slot(request_id)
             position_ids.append(reserved_position)
 
+        if any(
+            position_id >= self.config.max_sequence_length
+            for position_id in position_ids
+        ):
+            raise ValueError("Position ID exceeds maximum sequence length")
+
         position_ids = torch.tensor(position_ids, dtype=torch.long, device=input_ids.device).unsqueeze(1)
         hidden_states = self.embedding_helper(input_ids, position_ids)
 
+        # Block tables and lengths depend on the iteration, not the layer. Build
+        # them once and retain the same device tensors throughout the layer loop.
+        decode_metadata = kv_manager.build_decode_metadata(request_ids)
+
         for layer in self.layers:
-            hidden_states = layer.decode(hidden_states, request_ids, kv_manager, paged_attn_manager)
+            hidden_states = layer.decode(
+                hidden_states,
+                request_ids,
+                kv_manager,
+                paged_attn_manager,
+                decode_metadata,
+            )
 
         logits = self.output_layer(self.final_layernorm(hidden_states))  # [B,T,vocab_size]
 
@@ -223,6 +365,146 @@ class PagedDecoderLM(nn.Module):
             kv_manager.commit_token(request_id)
 
         return logits
+
+    def _forward_decode_tensor_core(
+        self,
+        hidden_states,
+        request_ids,
+        paged_attn_manager,
+        decode_metadata,
+    ):
+        for layer in self.layers:
+            hidden_states = layer.forward_decode_tensors(
+                hidden_states,
+                request_ids,
+                paged_attn_manager,
+                decode_metadata,
+            )
+        return self.output_layer(self.final_layernorm(hidden_states))
+
+    def _cuda_graph_key(self, hidden_states, decode_metadata, paged_attn_manager):
+        batch_size = hidden_states.shape[0]
+        if (
+            not self.enable_cuda_graphs
+            or paged_attn_manager.decode_attention_backend != "triton"
+            or not hidden_states.is_cuda
+            or not torch.is_inference_mode_enabled()
+            or batch_size not in CUDA_GRAPH_BATCH_SIZES
+        ):
+            return None
+        context_bucket = 1 << (
+            decode_metadata.maximum_context_length - 1
+        ).bit_length()
+        return (
+            hidden_states.device,
+            hidden_states.dtype,
+            batch_size,
+            context_bucket,
+            decode_metadata.block_table.stride(0),
+            self.config.hidden_size,
+            paged_attn_manager.kv_manager.cache_dtype,
+        )
+
+    def _capture_decode_cuda_graph(
+        self,
+        key,
+        hidden_states,
+        request_ids,
+        paged_attn_manager,
+        decode_metadata,
+    ):
+        static_hidden_states = torch.empty_like(hidden_states)
+        static_hidden_states.copy_(hidden_states)
+
+        # Compile/autotune Triton and populate allocator caches before capture.
+        warmup_stream = torch.cuda.Stream(device=hidden_states.device)
+        warmup_stream.wait_stream(torch.cuda.current_stream(hidden_states.device))
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                self._forward_decode_tensor_core(
+                    static_hidden_states,
+                    request_ids,
+                    paged_attn_manager,
+                    decode_metadata,
+                )
+        warmup_stream.synchronize()
+        torch.cuda.current_stream(hidden_states.device).wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_logits = self._forward_decode_tensor_core(
+                static_hidden_states,
+                request_ids,
+                paged_attn_manager,
+                decode_metadata,
+            )
+        entry = DecodeCUDAGraph(
+            graph,
+            static_hidden_states,
+            static_logits,
+            decode_metadata,
+        )
+        self._decode_cuda_graphs[key] = entry
+        return entry
+
+    def _forward_decode_with_cuda_graph(
+        self,
+        hidden_states,
+        request_ids,
+        kv_manager,
+        paged_attn_manager,
+        decode_metadata,
+    ):
+        key = self._cuda_graph_key(
+            hidden_states,
+            decode_metadata,
+            paged_attn_manager,
+        )
+        if key is None or key in self._decode_cuda_graph_failures:
+            return None
+        entry = self._decode_cuda_graphs.get(key)
+        if entry is None:
+            try:
+                entry = self._capture_decode_cuda_graph(
+                    key,
+                    hidden_states,
+                    request_ids,
+                    paged_attn_manager,
+                    decode_metadata,
+                )
+            except RuntimeError as error:
+                self._decode_cuda_graph_failures[key] = (
+                    f"{type(error).__name__}: {error}"
+                )
+                return None
+        elif (
+            entry.decode_metadata.block_table.untyped_storage().data_ptr()
+            != decode_metadata.block_table.untyped_storage().data_ptr()
+        ):
+            self._decode_cuda_graph_failures[key] = (
+                "decode metadata storage address changed"
+            )
+            return None
+
+        entry.hidden_states.copy_(hidden_states)
+        entry.graph.replay()
+        entry.replays += 1
+        # Python request bookkeeping is the control plane and is intentionally
+        # outside the captured GPU data path.
+        for layer_id in range(self.config.num_layers):
+            kv_manager.mark_reserved_layer_written(request_ids, layer_id)
+        return entry.logits
+
+    def cuda_graph_summary(self):
+        return {
+            "enabled": self.enable_cuda_graphs,
+            "enabled_batch_sizes": list(CUDA_GRAPH_BATCH_SIZES),
+            "captured_graphs": len(self._decode_cuda_graphs),
+            "graph_replays": sum(
+                entry.replays for entry in self._decode_cuda_graphs.values()
+            ),
+            "capture_failures": list(self._decode_cuda_graph_failures.values()),
+        }
 
     def forward_iteration(self, iteration_batch: IterationBatch, kv_manager: KVCacheManager, paged_attn_manager: PagedAttention):
         if iteration_batch.input_ids.device != next(self.parameters()).device:
@@ -234,14 +516,23 @@ class PagedDecoderLM(nn.Module):
         prefill_cache = {item.request_id: [] for item in iteration_batch.items if item.phase == "prefill"}
 
         for item in iteration_batch.items:
+            if item.position_ids[0] < 0:
+                raise ValueError("Position IDs cannot be negative")
+            if item.position_ids[-1] >= self.config.max_sequence_length:
+                raise ValueError("Position ID exceeds maximum sequence length")
             if item.phase == "prefill":
-                expected_positions = tuple(range(item.token_count))
+                prefill_start = item.position_ids[0]
+                expected_positions = tuple(
+                    range(prefill_start, prefill_start + item.token_count)
+                )
                 if item.position_ids != expected_positions:
-                    raise ValueError("Prefill positions must start at zero and be contiguous")
+                    raise ValueError("Prefill positions must be contiguous")
                 if item.request_id in kv_manager.requests:
                     request_info = kv_manager.requests[item.request_id]
-                    if request_info.sequence_length != 0:
-                        raise RuntimeError("Cannot prefill an existing request")
+                    if request_info.sequence_length != prefill_start:
+                        raise RuntimeError("Prefill chunk does not match the KV-cache length")
+                elif prefill_start != 0:
+                    raise RuntimeError("The first prefill chunk must start at zero")
             else:
                 if item.request_id not in kv_manager.requests:
                     raise RuntimeError("Cannot decode an unknown request")
@@ -251,31 +542,78 @@ class PagedDecoderLM(nn.Module):
 
         hidden_states = self.embedding_helper(iteration_batch.input_ids, iteration_batch.position_ids)
 
+        decode_request_ids = [
+            item.request_id for item in iteration_batch.items if item.phase == "decode"
+        ]
+        decode_token_offsets = [
+            item.start_offset for item in iteration_batch.items if item.phase == "decode"
+        ]
+        decode_metadata = (
+            kv_manager.build_decode_metadata(
+                decode_request_ids,
+                token_offsets=decode_token_offsets,
+            )
+            if decode_request_ids
+            else None
+        )
+
+        decode_only = len(decode_request_ids) == len(iteration_batch.items)
+        if decode_only:
+            logits = self._forward_decode_with_cuda_graph(
+                hidden_states,
+                decode_request_ids,
+                kv_manager,
+                paged_attn_manager,
+                decode_metadata,
+            )
+            if logits is None:
+                logits = self._forward_decode_tensor_core(
+                    hidden_states,
+                    decode_request_ids,
+                    paged_attn_manager,
+                    decode_metadata,
+                )
+            for request_id in decode_request_ids:
+                kv_manager.commit_token(request_id)
+            return logits
+
         for layer in self.layers:
             # Entire flattened tensor then passes through every decoder layer
-            hidden_states, layer_prefill_kv = layer.forward_iteration(hidden_states, iteration_batch.items, paged_attn_manager)
+            hidden_states, layer_prefill_kv = layer.forward_iteration(
+                hidden_states,
+                iteration_batch.items,
+                paged_attn_manager,
+                decode_metadata,
+            )
             for request_id, key_value in layer_prefill_kv.items():
                 prefill_cache[request_id].append(key_value)
 
-        logits = self.output_layer(self.final_layernorm(hidden_states))
+        output_items = [
+            item for item in iteration_batch.items if item.produces_output
+        ]
+        if output_items:
+            output_offsets = [item.end_offset - 1 for item in output_items]
+            if output_offsets == list(range(hidden_states.shape[0])):
+                output_hidden_states = hidden_states
+            else:
+                output_offsets = paged_attn_manager.inference_index_tensor(
+                    "model_output_offsets",
+                    output_offsets,
+                    hidden_states.device,
+                )
+                output_hidden_states = hidden_states.index_select(0, output_offsets)
+            logits = self.output_layer(self.final_layernorm(output_hidden_states))
+        else:
+            logits = hidden_states.new_empty((0, self.config.vocab_size))
 
         for item in iteration_batch.items:
             if item.phase == "prefill":
-                kv_manager.store_prefill_request(item.request_id, prefill_cache[item.request_id])
+                kv_manager.append_prefill_chunk(
+                    item.request_id,
+                    prefill_cache[item.request_id],
+                    start_position=item.position_ids[0],
+                )
             else:
                 kv_manager.commit_token(item.request_id)
 
-        return torch.stack([logits[item.end_offset - 1] for item in iteration_batch.items], dim=0)
-
-
-
-
-
-
-
-
-
-
-
-
-
+        return logits

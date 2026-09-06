@@ -11,6 +11,11 @@ from src.model.paged_attention import PagedAttention
 from src.model.paged_decoder import PagedDecoderLM
 
 
+ORCA_STRATEGY = "orca"
+SARATHI_STRATEGY = "sarathi"
+SUPPORTED_SCHEDULING_STRATEGIES = (ORCA_STRATEGY, SARATHI_STRATEGY)
+
+
 @dataclass
 class RequestState:
     request_id: int
@@ -20,6 +25,7 @@ class RequestState:
     generated_token_ids: list[int] = field(default_factory=list)
     pending_token_id: Optional[int] = None
     reserved_blocks: int = 0
+    prefill_cursor: int = 0
 
 
 class ContinuousBatchScheduler:
@@ -31,9 +37,19 @@ class ContinuousBatchScheduler:
         kv_manager: KVCacheManager,
         paged_attn_manager: PagedAttention,
         eos_token_id=None,
+        scheduling_strategy=ORCA_STRATEGY,
+        prefill_chunk_size=16,
     ):
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
+        if scheduling_strategy not in SUPPORTED_SCHEDULING_STRATEGIES:
+            choices = ", ".join(SUPPORTED_SCHEDULING_STRATEGIES)
+            raise ValueError(
+                f"Unknown scheduling strategy '{scheduling_strategy}'. "
+                f"Choose one of: {choices}"
+            )
+        if prefill_chunk_size <= 0:
+            raise ValueError("prefill_chunk_size must be positive")
 
         self.model_engine = model_engine
         self.max_batch_size = max_batch_size
@@ -41,8 +57,10 @@ class ContinuousBatchScheduler:
         self.kv_manager = kv_manager
         self.paged_attn_manager = paged_attn_manager
         self.eos_token_id = eos_token_id if eos_token_id is not None else getattr(tokenizer, "eos_token_id", None)
+        self.scheduling_strategy = scheduling_strategy
+        self.prefill_chunk_size = prefill_chunk_size
 
-        self.waiting = deque() # New requests that have never run prefill.
+        self.waiting = deque() # Requests with prompt tokens still to prefill.
         self.active: Dict[int, RequestState] = {} # Requests that finished prefill and are generating tokens.
         self.finished: Dict[int, RequestState] = {} # Completed requests whose KV blocks have been released.
         self.next_request_id = 0 # Every arriving request an increasing ID
@@ -51,10 +69,28 @@ class ContinuousBatchScheduler:
     def add_request(self, prompt, max_new_tokens=200):
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
-        if max_new_tokens <= 0:
-            raise ValueError("max_new_tokens must be positive")
 
         prompt_token_ids = self.tokenizer.encode(prompt)
+        if isinstance(prompt_token_ids, torch.Tensor):
+            prompt_token_ids = prompt_token_ids.reshape(-1).tolist()
+        else:
+            prompt_token_ids = list(prompt_token_ids)
+
+        return self.add_token_request(
+            prompt_token_ids,
+            max_new_tokens=max_new_tokens,
+            prompt=prompt,
+        )
+
+    def add_token_request(
+        self,
+        prompt_token_ids,
+        max_new_tokens=200,
+        prompt="<tokenized prompt>",
+    ):
+        """Add an already-tokenized request for exact workload reproduction."""
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
         if isinstance(prompt_token_ids, torch.Tensor):
             prompt_token_ids = prompt_token_ids.reshape(-1).tolist()
         else:
@@ -86,6 +122,9 @@ class ContinuousBatchScheduler:
         return math.ceil(maximum_tokens / self.kv_manager.block_size)
 
     def select_requests(self):
+        if self.scheduling_strategy == SARATHI_STRATEGY:
+            return self._select_sarathi_requests()
+
         request_pool = list(self.active.values()) + list(self.waiting)
         # FCFS scheduling
         request_pool.sort(key=lambda request: request.request_id)
@@ -96,7 +135,7 @@ class ContinuousBatchScheduler:
             if len(selected) == self.max_batch_size:
                 break
 
-            if request.pending_token_id is None:
+            if request.reserved_blocks == 0:
                 required_blocks = self._required_blocks(request)
                 if self.reserved_blocks + newly_reserved_blocks + required_blocks > self.kv_manager.total_available_blocks:
                     break
@@ -104,6 +143,29 @@ class ContinuousBatchScheduler:
 
             selected.append(request)
 
+        return selected
+
+    def _select_sarathi_requests(self):
+        """Select one prefill chunk and fill remaining slots with decodes."""
+        active_requests = sorted(
+            self.active.values(),
+            key=lambda request: request.request_id,
+        )
+        prefill_request = None
+
+        if self.waiting:
+            candidate = self.waiting[0]
+            if candidate.reserved_blocks > 0:
+                prefill_request = candidate
+            else:
+                required_blocks = self._required_blocks(candidate)
+                if self.reserved_blocks + required_blocks <= self.kv_manager.total_available_blocks:
+                    prefill_request = candidate
+
+        decode_capacity = self.max_batch_size - (1 if prefill_request else 0)
+        selected = active_requests[:decode_capacity]
+        if prefill_request is not None:
+            selected.append(prefill_request)
         return selected
 
     def build_iteration_batch(self, requests):
@@ -116,12 +178,22 @@ class ContinuousBatchScheduler:
         for request in requests:
             if request.pending_token_id is None:
                 phase = "prefill"
-                token_ids = tuple(request.prompt_token_ids)
-                position_ids = tuple(range(len(token_ids)))
+                prefill_start = request.prefill_cursor
+                if self.scheduling_strategy == SARATHI_STRATEGY:
+                    prefill_end = min(
+                        prefill_start + self.prefill_chunk_size,
+                        len(request.prompt_token_ids),
+                    )
+                else:
+                    prefill_end = len(request.prompt_token_ids)
+                token_ids = tuple(request.prompt_token_ids[prefill_start:prefill_end])
+                position_ids = tuple(range(prefill_start, prefill_end))
+                produces_output = prefill_end == len(request.prompt_token_ids)
             else:
                 phase = "decode"
                 token_ids = (request.pending_token_id,)
                 position_ids = (self.kv_manager.requests[request.request_id].sequence_length,)
+                produces_output = True
 
             end_offset = offset + len(token_ids)
             items.append(
@@ -132,6 +204,7 @@ class ContinuousBatchScheduler:
                     position_ids=position_ids,
                     start_offset=offset,
                     end_offset=end_offset,
+                    produces_output=produces_output,
                 )
             )
             flat_input_ids.extend(token_ids)
@@ -153,7 +226,7 @@ class ContinuousBatchScheduler:
             return {}
 
         # For every new request it records its block reservation
-        new_requests = [request for request in requests if request.pending_token_id is None]
+        new_requests = [request for request in requests if request.reserved_blocks == 0]
         for request in new_requests:
             request.reserved_blocks = self._required_blocks(request)
             self.reserved_blocks += request.reserved_blocks
@@ -161,7 +234,7 @@ class ContinuousBatchScheduler:
         iteration_batch = self.build_iteration_batch(requests)
         try:
             with torch.inference_mode():
-                # There is one logits row per request, not one row per flattened token
+                # Only decodes and final prefill chunks produce logits rows.
                 next_token_logits = self.model_engine.forward_iteration(
                     iteration_batch,
                     self.kv_manager,
@@ -174,13 +247,20 @@ class ContinuousBatchScheduler:
             raise
 
         # The scheduler selects the next token from each row using argmax
-        next_token_ids = next_token_logits.argmax(dim=-1).tolist()
-        selected_new_ids = {request.request_id for request in new_requests}
-        # Newly processed requests are removed from waiting because their prefill is complete
-        self.waiting = deque(request for request in self.waiting if request.request_id not in selected_new_ids)
-
+        next_token_ids = iter(next_token_logits.argmax(dim=-1).tolist())
         emitted_tokens = {}
-        for request, next_token_id in zip(requests, next_token_ids):
+        completed_prefill_ids = set()
+        for request, item in zip(requests, iteration_batch.items):
+            if item.phase == "prefill":
+                request.prefill_cursor += item.token_count
+                if request.prefill_cursor < len(request.prompt_token_ids):
+                    continue
+                completed_prefill_ids.add(request.request_id)
+
+            try:
+                next_token_id = next(next_token_ids)
+            except StopIteration as error:
+                raise RuntimeError("Model returned too few logits rows") from error
             request.generated_token_ids.append(next_token_id)
             request.pending_token_id = next_token_id
             emitted_tokens[request.request_id] = next_token_id
@@ -197,6 +277,20 @@ class ContinuousBatchScheduler:
                 self.finished[request.request_id] = request
             else:
                 self.active[request.request_id] = request
+
+        try:
+            next(next_token_ids)
+        except StopIteration:
+            pass
+        else:
+            raise RuntimeError("Model returned too many logits rows")
+
+        if completed_prefill_ids:
+            self.waiting = deque(
+                request
+                for request in self.waiting
+                if request.request_id not in completed_prefill_ids
+            )
 
         return emitted_tokens
 
